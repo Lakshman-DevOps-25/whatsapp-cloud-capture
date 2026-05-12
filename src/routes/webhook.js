@@ -151,6 +151,11 @@ async function handleInboundMessage(msg, value) {
                     'media.downloadedAt': stored.downloadedAt } }
         ))
         .catch(e => console.error(`❌ Media download failed (${m.id}):`, e.message));
+
+        console.log(`⏬ Downloading media ${m.id}...`);
+        console.log('media.localPath:', stored.localPath, ' - media.minioKey:', stored.minioKey,
+                    'media.minioUrl:', stored.minioUrl, ' - media.fileSize:', stored.fileSize,
+                    'media.downloadedAt:', stored.downloadedAt);
       break;
     }
 
