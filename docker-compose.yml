@@ -1,0 +1,44 @@
+version: '3.9'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local development stack:
+#   mongodb  → mongodb://localhost:27017
+#   minio    → http://localhost:9000  (API)
+#              http://localhost:9001  (Console UI — open in browser)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  mongodb:
+    image: mongo:7
+    container_name: wa_mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: whatsapp_capture
+
+  minio:
+    image: minio/minio:latest
+    container_name: wa_minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # S3-compatible API
+      - "9001:9001"   # MinIO Console (web UI)
+    volumes:
+      - minio_data:/data
+    environment:
+      MINIO_ROOT_USER:     minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongo_data:
+  minio_data:
