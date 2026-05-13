@@ -2,17 +2,25 @@
  * webhook.js
  * ─────────────────────────────────────────────────────────────────────────────
  * GET  /webhook  — Meta verification
- * POST /webhook  — All inbound events (messages + status updates)
+ * POST /webhook  — Inbound events from Meta
  *
- * DIRECTION DETECTION:
- *   Meta sends webhook events for BOTH directions:
- *   - customer → business : value.messages[] where msg.from = customer phone
- *   - business → customer : value.statuses[]  for API-sent messages
- *                           value.messages[]  echo when sent from WA app/web
+ * IMPORTANT — HOW META WEBHOOKS WORK:
  *
- * FROM / TO stored in MongoDB are always REAL phone numbers (E.164):
- *   inbound:  from = customer phone,       to = WA_BUSINESS_PHONE
- *   outbound: from = WA_BUSINESS_PHONE,    to = customer phone (msg.to)
+ *   value.messages[]  → ALWAYS customer → business (inbound)
+ *                        Meta only puts customer-sent messages here.
+ *                        Messages sent via API never appear in messages[].
+ *
+ *   value.statuses[]  → Delivery receipts for business → customer messages
+ *                        (sent, delivered, read, failed)
+ *                        These update the outbound records already saved
+ *                        by whatsappService.js saveOutbound().
+ *
+ * So this file ONLY handles:
+ *   1. Inbound messages  (customer → business) → save to MongoDB + MinIO
+ *   2. Status updates    (delivery receipts)   → update existing MongoDB record
+ *
+ * Outbound messages (business → customer) are saved by whatsappService.js
+ * BEFORE the message is sent to Meta. Webhook only updates their status.
  */
 
 import express from 'express';
@@ -22,8 +30,7 @@ import { downloadAndStoreMedia } from '../services/mediaService.js';
 
 const router = express.Router();
 
-// Our business phone number (real number, not phone number ID)
-const MY_PHONE = () => (process.env.WA_BUSINESS_PHONE || process.env.WA_PHONE_NUMBER_ID || '').trim();
+const MY_PHONE = () => (process.env.WA_BUSINESS_PHONE || '').trim();
 
 // ─── GET /webhook — Meta verification ────────────────────────────────────────
 router.get('/', (req, res) => {
@@ -40,16 +47,26 @@ router.get('/', (req, res) => {
 
 // ─── POST /webhook ────────────────────────────────────────────────────────────
 router.post('/', async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // respond immediately
+
   try {
     const body = req.body;
     if (body.object !== 'whatsapp_business_account') return;
+
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value;
         if (!value) continue;
-        for (const msg    of value.messages  || []) await handleMessage(msg, value);
-        for (const status of value.statuses  || []) await handleStatus(status);
+
+        // messages[] = inbound from customer (direction always = inbound)
+        for (const msg of value.messages || []) {
+          await handleInbound(msg, value);
+        }
+
+        // statuses[] = delivery receipts for outbound messages sent via API
+        for (const status of value.statuses || []) {
+          await handleStatus(status);
+        }
       }
     }
   } catch (err) {
@@ -58,60 +75,44 @@ router.post('/', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handle a single message event
+// INBOUND: customer → business
+// All messages[] events are from customers. direction = inbound always.
 // ─────────────────────────────────────────────────────────────────────────────
-async function handleMessage(msg, value) {
-  const phoneNumberId = value.metadata?.phone_number_id;   // e.g. "123456789012345" (ID, not phone)
-  const myPhone       = MY_PHONE();                         // e.g. "919000000000"    (real phone)
-
-  // ── Direction detection ──────────────────────────────────────────────────
-  // msg.from = sender's real phone number (E.164 always)
-  // msg.to   = recipient's real phone number (E.164 always) — present in echo events
-  //
-  // Outbound echo: msg.from matches our business phone number OR phone number ID
-  const isOutbound = msg.from === myPhone || msg.from === phoneNumberId;
-  const direction  = isOutbound ? 'outbound' : 'inbound';
-
-  // ── Real phone numbers for from/to ───────────────────────────────────────
-  // inbound:  from=customer,  to=our business phone
-  // outbound: from=our phone, to=customer (msg.to is the recipient real phone)
-  const fromPhone     = isOutbound ? myPhone    : msg.from;
-  const toPhone       = isOutbound ? (msg.to || '') : myPhone;
-  const customerPhone = isOutbound ? toPhone    : fromPhone;
-
+async function handleInbound(msg, value) {
+  const myPhone     = MY_PHONE();
+  const fromPhone   = msg.from;           // customer's real phone number (E.164)
+  const toPhone     = myPhone;            // our business phone number
   const isMedia     = ['image','video','audio','document','sticker'].includes(msg.type);
   const contactInfo = value.contacts?.find(c => c.wa_id === msg.from);
   const contactName = contactInfo?.profile?.name || '';
 
-  console.log(`📨 ${direction.toUpperCase()} | type=${msg.type} | from=${fromPhone} | to=${toPhone}`);
+  console.log(`📩 INBOUND | type=${msg.type} | from=${fromPhone} | to=${toPhone}`);
 
-  // ── Upsert contact (always the customer side) ─────────────────────────────
-  if (customerPhone) {
-    try {
-      await Contact.findOneAndUpdate(
-        { phone: customerPhone },
-        {
-          $set:         { phone: customerPhone, waId: customerPhone, name: contactName, lastSeen: new Date() },
-          $inc:         { messageCount: 1, ...(isMedia ? { mediaCount: 1 } : {}) },
-          $setOnInsert: { firstSeen: new Date() },
-        },
-        { upsert: true, new: true }
-      );
-    } catch (err) {
-      console.error(`⚠️  Contact upsert(${customerPhone}):`, err.message);
-    }
+  // ── Upsert customer contact ───────────────────────────────────────────────
+  try {
+    await Contact.findOneAndUpdate(
+      { phone: fromPhone },
+      {
+        $set:         { phone: fromPhone, waId: fromPhone, name: contactName, lastSeen: new Date() },
+        $inc:         { messageCount: 1, ...(isMedia ? { mediaCount: 1 } : {}) },
+        $setOnInsert: { firstSeen: new Date() },
+      },
+      { upsert: true, new: true }
+    );
+  } catch (err) {
+    console.error(`⚠️  Contact upsert(${fromPhone}):`, err.message);
   }
 
   // ── Build document ────────────────────────────────────────────────────────
   const doc = {
     messageId:        msg.id,
-    direction,
-    from:             fromPhone,        // always a real phone number
-    to:               toPhone,          // always a real phone number
+    direction:        'inbound',
+    from:             fromPhone,
+    to:               toPhone,
     contactName,
     type:             msg.type,
     waTimestamp:      new Date(parseInt(msg.timestamp) * 1000),
-    status:           isOutbound ? 'sent' : 'received',
+    status:           'received',
     contextMessageId: msg.context?.id || null,
     rawPayload:       msg,
   };
@@ -193,7 +194,6 @@ async function handleMessage(msg, value) {
     default:
       doc.type = 'unsupported';
       doc.body = `[unsupported: ${msg.type}]`;
-      console.log(`   ❓ "${msg.type}"`);
   }
 
   // ── Save to MongoDB ───────────────────────────────────────────────────────
@@ -203,24 +203,24 @@ async function handleMessage(msg, value) {
       { $set: doc },
       { upsert: true, new: true }
     );
-    console.log(`   ✅ DB saved ${direction} from=${fromPhone} to=${toPhone} [${msg.id}]`);
+    console.log(`   ✅ DB saved inbound [${msg.id}] _id=${saved._id}`);
   } catch (err) {
     console.error(`   ❌ DB save failed (${msg.id}):`, err.message);
     return;
   }
 
-  // ── Download + store media ────────────────────────────────────────────────
+  // ── Download + store media in MinIO/local ─────────────────────────────────
   if (isMedia && doc.media?.mediaId) {
     downloadAndStoreMedia(doc.media.mediaId, doc.media.mimeType, doc.media.fileName || null)
       .then(async (stored) => {
-        const mediaUpdate = {};
-        if (stored.localPath)    mediaUpdate['media.localPath']    = stored.localPath;
-        if (stored.minioKey)     mediaUpdate['media.minioKey']     = stored.minioKey;
-        if (stored.minioUrl)     mediaUpdate['media.minioUrl']     = stored.minioUrl;
-        if (stored.fileSize)     mediaUpdate['media.fileSize']     = stored.fileSize;
-        if (stored.downloadedAt) mediaUpdate['media.downloadedAt'] = stored.downloadedAt;
-        if (Object.keys(mediaUpdate).length > 0) {
-          await Message.findOneAndUpdate({ messageId: msg.id }, { $set: mediaUpdate });
+        const update = {};
+        if (stored.localPath)    update['media.localPath']    = stored.localPath;
+        if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
+        if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
+        if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
+        if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
+        if (Object.keys(update).length > 0) {
+          await Message.findOneAndUpdate({ messageId: msg.id }, { $set: update });
           console.log(`   ✅ Media stored: ${stored.minioUrl || stored.localPath}`);
         }
       })
@@ -229,7 +229,8 @@ async function handleMessage(msg, value) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handle status update
+// STATUS UPDATE: delivery receipt for outbound message
+// Updates the record already saved by whatsappService.js saveOutbound()
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleStatus(status) {
   try {
@@ -238,8 +239,15 @@ async function handleStatus(status) {
       update.errorCode    = status.errors[0].code?.toString();
       update.errorMessage = status.errors[0].title;
     }
-    const updated = await Message.findOneAndUpdate({ messageId: status.id }, { $set: update });
-    if (updated) console.log(`📬 STATUS [${status.id}] → ${status.status}`);
+    const updated = await Message.findOneAndUpdate(
+      { messageId: status.id },
+      { $set: update }
+    );
+    if (updated) {
+      console.log(`📬 STATUS [${status.id}] → ${status.status}`);
+    } else {
+      console.warn(`⚠️  STATUS: no message found for id=${status.id} status=${status.status}`);
+    }
   } catch (err) {
     console.error(`⚠️  Status update(${status.id}):`, err.message);
   }
