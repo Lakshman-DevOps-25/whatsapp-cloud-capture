@@ -24,6 +24,7 @@ const STORAGE    = () => (process.env.MEDIA_STORAGE || 'local').trim().toLowerCa
 const UPLOAD_DIR = () => process.env.UPLOAD_DIR || './uploads';
 const BUCKET     = () => (process.env.MINIO_BUCKET || 'whatsapp-media').trim();
 
+
 // Tracks whether we have already verified the bucket exists this session
 let _bucketVerified = false;
 
