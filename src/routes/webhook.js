@@ -209,22 +209,31 @@ async function handleInbound(msg, value) {
     return;
   }
 
-  // ── Download + store media in MinIO/local ─────────────────────────────────
+  // ── Download + store media in MinIO/local (runs async after webhook 200 response) ──
   if (isMedia && doc.media?.mediaId) {
-    downloadAndStoreMedia(doc.media.mediaId, doc.media.mimeType, doc.media.fileName || null)
-      .then(async (stored) => {
-        const update = {};
-        if (stored.localPath)    update['media.localPath']    = stored.localPath;
-        if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
-        if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
-        if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
-        if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
-        if (Object.keys(update).length > 0) {
-          await Message.findOneAndUpdate({ messageId: msg.id }, { $set: update });
-          console.log(`   ✅ Media stored: ${stored.minioUrl || stored.localPath}`);
-        }
-      })
-      .catch(err => console.error(`   ❌ Media store failed (${doc.media.mediaId}):`, err.message));
+    storeInboundMedia(msg.id, doc.media.mediaId, doc.media.mimeType, doc.media.fileName || null);
+  }
+}
+
+async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
+  console.log(`\n   📥 Storing inbound media: mediaId=${mediaId}`);
+  try {
+    const stored = await downloadAndStoreMedia(mediaId, mimeType, fileName);
+
+    const update = {};
+    if (stored.localPath)    update['media.localPath']    = stored.localPath;
+    if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
+    if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
+    if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
+    if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
+
+    if (Object.keys(update).length > 0) {
+      await Message.findOneAndUpdate({ messageId }, { $set: update });
+      console.log(`   ✅ Inbound media stored and DB updated: ${stored.minioUrl || stored.localPath}`);
+    }
+  } catch (err) {
+    console.error(`   ❌ Inbound media store FAILED for mediaId=${mediaId}: ${err.message}`);
+    console.error(`      Stack: ${err.stack}`);
   }
 }
 

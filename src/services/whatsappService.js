@@ -110,12 +110,15 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
 }
 
 // ─── Store outbound media to MinIO/local ─────────────────────────────────────
+// Does NOT catch errors — callers handle them individually so errors show in logs
 async function storeMedia(opts, mimeType) {
   if (opts.filePath) {
+    console.log(`   📁 storeLocalFile: ${opts.filePath}`);
     return await storeLocalFile(opts.filePath, mimeType);
   }
   if (opts.url) {
     const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
+    console.log(`   🌍 downloadUrlAndStore: ${opts.url}`);
     return await downloadUrlAndStore(opts.url, mimeType, prefix);
   }
   return {};
