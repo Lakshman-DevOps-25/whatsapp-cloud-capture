@@ -58,17 +58,6 @@ async function upsertContact(phone) {
 // ─── Save outbound to MongoDB ─────────────────────────────────────────────────
 async function saveOutbound(to, type, messageId, fields = {}) {
   if (!messageId) throw new Error(`saveOutbound: no messageId (type=${type} to=${to})`);
-  console.log("In saveOutbound function");
-  try {
-    const doc = {
-      messageId,
-      direction:   'outbound',
-      from:        process.env.WA_PHONE_NUMBER_ID,
-      to,
-      type,
-      waTimestamp: new Date(),
-      status:      'sent',
-    };
 
   const doc = {
     messageId,
@@ -90,16 +79,8 @@ async function saveOutbound(to, type, messageId, fields = {}) {
     { $set: doc },
     { upsert: true, new: true }
   );
-    console.log(`✅ DB saved outbound ${type} → ${to} [${messageId}] _id=${saved._id}`);
-    
-    console.log("Saved in Message table");
-
-    console.log(`📤 OUTBOUND ${type} → ${to} [${messageId}]`);
-    
-    return saved;
-  } catch (err) {
-    console.error('⚠️  Failed to persist outbound message:', err.message);
-  }
+  console.log(`✅ DB saved outbound ${type} → ${to} [${messageId}] _id=${saved._id}`);
+  return saved;
 }
 
 // ─── Store outbound media to MinIO/local ─────────────────────────────────────
