@@ -80,10 +80,6 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   // Use upsert — handles race where status webhook already created a placeholder
   const doc = {
     messageId:   realMessageId,
-    direction:   'outbound',
-    from:        fromPhone,
-    to:          toPhone,
-    type: 'text',
     waTimestamp: new Date(),
     status:      'sent',
   };
