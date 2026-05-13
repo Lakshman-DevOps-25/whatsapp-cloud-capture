@@ -80,6 +80,10 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   // Use upsert — handles race where status webhook already created a placeholder
   const doc = {
     messageId:   realMessageId,
+    direction:   'outbound',
+    from:        fromPhone,
+    to:          toPhone,
+    type,
     waTimestamp: new Date(),
     status:      'sent',
   };
@@ -91,7 +95,16 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   try {
     const saved = await Message.findOneAndUpdate(
       { messageId: realMessageId },
-      { $set: doc },
+      // { $set: doc },
+      {
+        messageId:   realMessageId,
+        direction:   'outbound',
+        from:        fromPhone,
+        to:          toPhone,
+        type,
+        waTimestamp: new Date(),
+        status:      'sent',
+      },
       { upsert: true, new: true }
     );
     console.log(`   ✅ DB saved: _id=${saved._id} | from=${saved.from} | to=${saved.to}`);
