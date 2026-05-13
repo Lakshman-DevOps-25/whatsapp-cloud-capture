@@ -54,6 +54,7 @@ const MessageSchema = new mongoose.Schema({
       'reaction',
       'order',
       'unsupported',
+      'unknown',   // placeholder created by status webhook before send completes
     ],
     index: true,
   },

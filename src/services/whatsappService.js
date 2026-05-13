@@ -58,56 +58,52 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   console.log(`\n${'─'.repeat(50)}`);
   console.log(`📤 ${type.toUpperCase()} → from=${fromPhone} to=${toPhone}`);
 
-  // ── Step 1: Save to DB with temp ID BEFORE sending ────────────────────────
-  // This guarantees the record exists before Meta's status webhook fires.
-  const tempId = `pending_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  // ── Step 1: Send to Meta ─────────────────────────────────────────────────
+  let metaRes;
+  try {
+    metaRes = await postMessage(metaPayload);
+  } catch (metaErr) {
+    console.error(`   ❌ Meta send FAILED: ${metaErr.message}`);
+    throw metaErr;
+  }
+
+  const realMessageId = metaRes?.messages?.[0]?.id;
+  if (!realMessageId) {
+    throw new Error(`Meta returned no messageId: ${JSON.stringify(metaRes)}`);
+  }
+  console.log(`   🆔 messageId: ${realMessageId}`);
+
+  // ── Step 2: Upsert to MongoDB with the real messageId ──────────────────────
+  // Use upsert so that:
+  //   a) If status webhook already created a placeholder → update it with full data
+  //   b) If no placeholder yet → create the full record now
   const doc = {
-    messageId:   tempId,
+    messageId:   realMessageId,
     direction:   'outbound',
     from:        fromPhone,
     to:          toPhone,
     type,
     waTimestamp: new Date(),
-    status:      'queued',
+    status:      'sent',
   };
   if (extraFields.body)       doc.body       = extraFields.body;
   if (extraFields.media)      doc.media      = extraFields.media;
   if (extraFields.location)   doc.location   = extraFields.location;
   if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
-  let dbRecord;
   try {
-    dbRecord = await Message.create(doc);
-    console.log(`   💾 Pre-saved to DB: _id=${dbRecord._id} status=queued`);
+    const saved = await Message.findOneAndUpdate(
+      { messageId: realMessageId },
+      { $set: doc },
+      { upsert: true, new: true }
+    );
+    console.log(`   ✅ DB saved: _id=${saved._id} direction=outbound from=${saved.from} to=${saved.to} type=${saved.type}`);
   } catch (dbErr) {
-    console.error(`   ❌ Pre-save FAILED: ${dbErr.message}`);
-    throw new Error(`DB pre-save failed: ${dbErr.message}`);
+    console.error(`   ❌ DB save FAILED: ${dbErr.message}`);
+    // Don't throw — message was already delivered to customer
   }
 
-  // ── Step 2: Send to Meta ──────────────────────────────────────────────────
-  let metaRes;
-  try {
-    metaRes = await postMessage(metaPayload);
-  } catch (metaErr) {
-    // Meta send failed — mark DB record as failed
-    await Message.findByIdAndUpdate(dbRecord._id, { $set: { status: 'failed', errorMessage: metaErr.message } });
-    console.error(`   ❌ Meta send FAILED: ${metaErr.message}`);
-    throw metaErr;
-  }
-
-  // ── Step 3: Update DB record with real messageId from Meta ────────────────
-  const realMessageId = metaRes?.messages?.[0]?.id;
-  if (!realMessageId) {
-    await Message.findByIdAndUpdate(dbRecord._id, { $set: { status: 'failed', errorMessage: 'No messageId in Meta response' } });
-    throw new Error(`Meta returned no messageId: ${JSON.stringify(metaRes)}`);
-  }
-
-  await Message.findByIdAndUpdate(dbRecord._id, {
-    $set: { messageId: realMessageId, status: 'sent' },
-  });
-  console.log(`   ✅ DB updated: messageId=${realMessageId} status=sent`);
-
-  // ── Step 4: Upsert contact ────────────────────────────────────────────────
+  // ── Step 3: Upsert contact ────────────────────────────────────────────────
   await upsertContact(toPhone);
 
   return metaRes;

@@ -230,26 +230,49 @@ async function handleInbound(msg, value) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STATUS UPDATE: delivery receipt for outbound message
-// Updates the record already saved by whatsappService.js saveOutbound()
+//
+// Meta fires status=sent almost instantly after the API call — sometimes
+// before Message.create() finishes. So we UPSERT:
+//   - record exists  → update status field
+//   - record missing → create a placeholder (direction=outbound, type=unknown)
+//     sendAndSave() will later update the same messageId with full details,
+//     or this placeholder becomes the permanent record.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleStatus(status) {
   try {
-    const update = { status: status.status };
+    const myPhone        = (process.env.WA_BUSINESS_PHONE || process.env.WA_PHONE_NUMBER_ID || '').trim();
+    const recipientPhone = status.recipient_id || '';
+
+    const setFields = {
+      status:      status.status,
+      direction:   'outbound',
+      from:        myPhone,
+      to:          recipientPhone,
+      waTimestamp: status.timestamp ? new Date(parseInt(status.timestamp) * 1000) : new Date(),
+    };
+
     if (status.errors?.[0]) {
-      update.errorCode    = status.errors[0].code?.toString();
-      update.errorMessage = status.errors[0].title;
+      setFields.errorCode    = status.errors[0].code?.toString();
+      setFields.errorMessage = status.errors[0].title;
     }
-    const updated = await Message.findOneAndUpdate(
+
+    const result = await Message.findOneAndUpdate(
       { messageId: status.id },
-      { $set: update }
+      {
+        $set:         setFields,
+        $setOnInsert: { messageId: status.id, type: 'unknown' },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
-    if (updated) {
-      console.log(`📬 STATUS [${status.id}] → ${status.status}`);
+
+    const isPlaceholder = result.type === 'unknown';
+    if (isPlaceholder) {
+      console.log(`📬 STATUS [${status.id}] → ${status.status} (placeholder created)`);
     } else {
-      console.warn(`⚠️  STATUS: no message found for id=${status.id} status=${status.status}`);
+      console.log(`📬 STATUS [${status.id}] → ${status.status} from=${result.from} to=${result.to}`);
     }
   } catch (err) {
-    console.error(`⚠️  Status update(${status.id}):`, err.message);
+    console.error(`⚠️  Status update(${status.id}): ${err.message}`);
   }
 }
 
