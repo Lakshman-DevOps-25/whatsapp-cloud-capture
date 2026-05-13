@@ -17,9 +17,11 @@ import { pipeline } from 'stream/promises';
 import { PassThrough } from 'stream';
 import { getMinioClient, objectUrl } from '../config/minioClient.js';
 
-const BASE_URL   = `https://graph.facebook.com/${process.env.WA_API_VERSION}`;
+const BASE_URL   = () => `https://graph.facebook.com/${process.env.WA_API_VERSION}`;
 const TOKEN      = () => process.env.WA_ACCESS_TOKEN;
-const STORAGE    = () => process.env.MEDIA_STORAGE || 'local';
+// const STORAGE    = () => process.env.MEDIA_STORAGE || 'local';
+// ✅ FIXED — normalised before comparing
+const STORAGE    = () => (process.env.MEDIA_STORAGE || 'local').trim().toLowerCase();
 const UPLOAD_DIR = () => process.env.UPLOAD_DIR    || './uploads';
 const BUCKET     = () => process.env.MINIO_BUCKET  || 'whatsapp-media';
 
