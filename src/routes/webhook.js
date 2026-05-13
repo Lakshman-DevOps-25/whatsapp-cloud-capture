@@ -249,7 +249,7 @@ async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleStatus(status) {
   try {
-    const myPhone        = (process.env.WA_BUSINESS_PHONE || process.env.WA_PHONE_NUMBER_ID || '').trim();
+    const myPhone        = (process.env.WA_BUSINESS_PHONE || '').trim();
     const recipientPhone = status.recipient_id || '';
 
     const setFields = {
