@@ -19,6 +19,7 @@
 import axios       from 'axios';
 import fs          from 'fs';                   // static import — no dynamic import
 import path        from 'path';
+import os          from 'os';
 import { createWriteStream, mkdirSync } from 'fs';
 import { pipeline } from 'stream/promises';
 import { PassThrough } from 'stream';
@@ -28,7 +29,7 @@ import { getMinioClient, objectUrl } from '../config/minioClient.js';
 const BASE_URL   = () => `https://graph.facebook.com/${process.env.WA_API_VERSION}`;
 const TOKEN      = () => process.env.WA_ACCESS_TOKEN;
 const STORAGE    = () => (process.env.MEDIA_STORAGE || 'local').trim().toLowerCase();
-const UPLOAD_DIR = () => process.env.UPLOAD_DIR || './uploads';
+const UPLOAD_DIR = () => process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'wa_media');
 const BUCKET     = () => (process.env.MINIO_BUCKET || 'whatsapp-media').trim();
 
 // ── MIME helpers ──────────────────────────────────────────────────────────────
