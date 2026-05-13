@@ -1,18 +1,15 @@
 /**
  * whatsappService.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Helpers for SENDING messages via WhatsApp Cloud API.
+ * OUTBOUND messages: business → customer
  *
- * Every send function does THREE things:
- *   1. POST the message to Meta's Graph API
- *   2. Upsert the recipient contact in MongoDB
- *   3. Save the outbound message with the real Meta message ID to MongoDB
- *
- * For outbound media sent via file upload:
- *   4. Uploads the file to MinIO (copy of what was sent) and stores minioUrl
- *
- * Status updates (sent → delivered → read) arrive via webhook.js using the
- * real messageId returned here and stored in MongoDB.
+ * Every send function:
+ *   1. If filePath provided  → storeLocalFile()     → MinIO/local (permanent copy)
+ *   2. If URL provided       → downloadUrlAndStore() → MinIO/local (permanent copy)
+ *   3. Uploads to WhatsApp CDN (get mediaId)
+ *   4. POSTs to Meta Graph API (delivers to customer)
+ *   5. upsertContact() → MongoDB contacts
+ *   6. saveOutbound()  → MongoDB messages
  */
 
 import axios from 'axios';
@@ -21,95 +18,108 @@ import path from 'path';
 import FormData from 'form-data';
 import Message from '../models/Message.js';
 import Contact from '../models/Contact.js';
-import { getMinioClient, objectUrl } from '../config/minioClient.js';
-import { extFromMime, mediaTypeFolder } from './mediaService.js';
+import { mediaTypeFolder, downloadUrlAndStore, storeLocalFile } from './mediaService.js';
 
 const BASE_URL = () =>
   `https://graph.facebook.com/${process.env.WA_API_VERSION}/${process.env.WA_PHONE_NUMBER_ID}`;
 
-const authHeader = () => ({
-  Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}`,
-});
+const authHeader = () => ({ Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}` });
 
-// ─── Low-level POST to /messages ─────────────────────────────────────────────
+// ─── Low-level POST to Meta /messages ────────────────────────────────────────
 async function postMessage(payload) {
   const { data } = await axios.post(`${BASE_URL()}/messages`, payload, {
     headers: { ...authHeader(), 'Content-Type': 'application/json' },
+    timeout: 15000,
   });
   return data;
 }
 
-// ─── Upsert recipient contact ─────────────────────────────────────────────────
+// ─── Extract messageId — throw immediately if missing ────────────────────────
+function extractMessageId(res, type) {
+  const messageId = res?.messages?.[0]?.id;
+  if (!messageId) throw new Error(`Meta API no messageId for ${type}: ${JSON.stringify(res)}`);
+  return messageId;
+}
+
+// ─── Upsert contact ───────────────────────────────────────────────────────────
 async function upsertContact(phone) {
   try {
     await Contact.findOneAndUpdate(
       { phone },
-      {
-        $set:         { phone, waId: phone, lastSeen: new Date() },
-        $inc:         { messageCount: 1 },
-        $setOnInsert: { firstSeen: new Date() },
-      },
+      { $set: { phone, waId: phone, lastSeen: new Date() }, $inc: { messageCount: 1 }, $setOnInsert: { firstSeen: new Date() } },
       { upsert: true, new: true }
     );
+    console.log(`👤 Contact upserted: ${phone}`);
   } catch (err) {
-    console.error('⚠️  Failed to upsert contact:', err.message);
+    console.error(`⚠️  upsertContact(${phone}):`, err.message);
   }
 }
 
-// ─── Save outbound message to MongoDB ────────────────────────────────────────
+// ─── Save outbound to MongoDB ─────────────────────────────────────────────────
 async function saveOutbound(to, type, messageId, fields = {}) {
-  try {
-    const doc = {
-      messageId,
-      direction:   'outbound',
-      from:        process.env.WA_PHONE_NUMBER_ID,
-      to,
-      type,
-      waTimestamp: new Date(),
-      status:      'sent',
-    };
+  if (!messageId) throw new Error(`saveOutbound: no messageId (type=${type} to=${to})`);
 
-    if (fields.body)        doc.body        = fields.body;
-    if (fields.media)       doc.media       = fields.media;
-    if (fields.location)    doc.location    = fields.location;
-    if (fields.buttonReply) doc.buttonReply = fields.buttonReply;
-    if (fields.rawPayload)  doc.rawPayload  = fields.rawPayload;
+  const doc = {
+    messageId,
+    direction:   'outbound',
+    from:        process.env.WA_PHONE_NUMBER_ID,
+    to,
+    type,
+    waTimestamp: new Date(),
+    status:      'sent',
+  };
+  if (fields.body)        doc.body        = fields.body;
+  if (fields.media)       doc.media       = fields.media;
+  if (fields.location)    doc.location    = fields.location;
+  if (fields.buttonReply) doc.buttonReply = fields.buttonReply;
+  if (fields.rawPayload)  doc.rawPayload  = fields.rawPayload;
 
-    await Message.findOneAndUpdate(
-      { messageId },
-      { $set: doc },
-      { upsert: true, new: true }
-    );
-
-    console.log(`📤 OUTBOUND ${type} → ${to} [${messageId}]`);
-  } catch (err) {
-    console.error('⚠️  Failed to persist outbound message:', err.message);
-  }
+  const saved = await Message.findOneAndUpdate(
+    { messageId },
+    { $set: doc },
+    { upsert: true, new: true }
+  );
+  console.log(`✅ DB saved outbound ${type} → ${to} [${messageId}] _id=${saved._id}`);
+  return saved;
 }
 
-// ─── Upload outbound file to MinIO (keeps a copy of every sent media) ────────
-async function storeOutboundInMinIO(filePath, mimeType) {
-  if (process.env.MEDIA_STORAGE !== 'minio') return {};
+// ─── Store outbound media to MinIO/local ─────────────────────────────────────
+// Works for BOTH file uploads and URL-based sends.
+// Returns { minioKey, minioUrl } or { localPath } depending on MEDIA_STORAGE.
+async function storeOutboundMedia(opts, mimeType, label) {
   try {
-    const minioClient = getMinioClient();
-    const bucket      = process.env.MINIO_BUCKET || 'whatsapp-media';
-    const folder      = mediaTypeFolder(mimeType);
-    const fileName    = `${Date.now()}-${path.basename(filePath)}`;
-    const objectKey   = `whatsapp/outbound/${folder}/${fileName}`;
-    const fileStream  = fs.createReadStream(filePath);
-    const fileSize    = fs.statSync(filePath).size;
-
-    await minioClient.putObject(bucket, objectKey, fileStream, fileSize, {
-      'Content-Type': mimeType,
-    });
-
-    const minioUrl = objectUrl(objectKey);
-    console.log(`   ✅ MinIO outbound stored → ${objectKey}`);
-    return { minioKey: objectKey, minioUrl };
+    if (opts.filePath) {
+      // Sent via file upload
+      return await storeLocalFile(opts.filePath, mimeType);
+    } else if (opts.url) {
+      // Sent via public URL — download it and store a copy
+      const folder = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
+      return await downloadUrlAndStore(opts.url, mimeType, folder, null);
+    }
   } catch (err) {
-    console.error('⚠️  MinIO outbound upload failed:', err.message);
-    return {};
+    // Non-fatal: message still gets delivered and saved to MongoDB
+    // MinIO/local copy just won't be available
+    console.error(`   ⚠️  Media store failed for ${label} (non-fatal):`, err.message);
   }
+  return {};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UPLOAD to WhatsApp CDN (for file-based sends)
+// ─────────────────────────────────────────────────────────────────────────────
+export async function uploadMedia(filePath, mimeType) {
+  const form = new FormData();
+  form.append('messaging_product', 'whatsapp');
+  form.append('file', fs.createReadStream(filePath), {
+    contentType: mimeType,
+    filename:    path.basename(filePath),
+  });
+  const { data } = await axios.post(`${BASE_URL()}/media`, form, {
+    headers: { ...authHeader(), ...form.getHeaders() },
+    timeout: 30000,
+  });
+  console.log(`   ☁️  WA CDN mediaId: ${data.id}`);
+  return data.id;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,237 +128,228 @@ async function storeOutboundInMinIO(filePath, mimeType) {
 
 // ─── 1. Text ──────────────────────────────────────────────────────────────────
 export async function sendText(to, text, previewUrl = false) {
-  const res = await postMessage({
-    messaging_product: 'whatsapp',
-    recipient_type:    'individual',
-    to,
-    type: 'text',
-    text: { body: text, preview_url: previewUrl },
-  });
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'text', messageId, { body: text });
-  return res;
+  try {
+    console.log(`📤 sendText → ${to}`);
+    const res       = await postMessage({ messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { body: text, preview_url: previewUrl } });
+    const messageId = extractMessageId(res, 'text');
+    await upsertContact(to);
+    await saveOutbound(to, 'text', messageId, { body: text });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendText(${to}):`, err.message);
+    throw err;
+  }
 }
 
 // ─── 2. Image ─────────────────────────────────────────────────────────────────
 // opts: { url?, mediaId?, caption?, filePath?, mimeType? }
-// Use filePath to send a local file — it gets uploaded to WA CDN + copied to MinIO
 export async function sendImage(to, { url, mediaId, caption = '', filePath, mimeType = 'image/jpeg' }) {
-  let resolvedId = mediaId;
-  let minioData  = {};
+  try {
+    console.log(`📤 sendImage → ${to}  [${filePath ? 'file' : url ? 'url' : 'mediaId'}]`);
 
-  if (filePath) {
-    resolvedId = await uploadMedia(filePath, mimeType);
-    minioData  = await storeOutboundInMinIO(filePath, mimeType);
+    // 1. Store copy in MinIO/local
+    const stored = await storeOutboundMedia({ filePath, url }, mimeType, 'image');
+
+    // 2. Get WhatsApp mediaId
+    let resolvedId = mediaId;
+    if (filePath)  resolvedId = await uploadMedia(filePath, mimeType);
+    if (!resolvedId && !url) throw new Error('sendImage: provide url, mediaId, or filePath');
+
+    // 3. Send via Meta API
+    const imageObj = resolvedId ? { id: resolvedId } : { link: url };
+    if (caption) imageObj.caption = caption;
+    const res       = await postMessage({ messaging_product: 'whatsapp', to, type: 'image', image: imageObj });
+    const messageId = extractMessageId(res, 'image');
+
+    // 4. Save to MongoDB
+    await upsertContact(to);
+    await saveOutbound(to, 'image', messageId, {
+      body:  caption,
+      media: { mediaId: resolvedId, mimeType, caption, ...stored },
+    });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendImage(${to}):`, err.message);
+    throw err;
   }
-
-  const imageObj = resolvedId ? { id: resolvedId } : { link: url };
-  if (caption) imageObj.caption = caption;
-
-  const res = await postMessage({ messaging_product: 'whatsapp', to, type: 'image', image: imageObj });
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'image', messageId, {
-    body:  caption,
-    media: { mediaId: resolvedId, mimeType, caption, ...minioData },
-  });
-  return res;
 }
 
 // ─── 3. Video ─────────────────────────────────────────────────────────────────
 export async function sendVideo(to, { url, mediaId, caption = '', filePath, mimeType = 'video/mp4' }) {
-  let resolvedId = mediaId;
-  let minioData  = {};
+  try {
+    console.log(`📤 sendVideo → ${to}  [${filePath ? 'file' : url ? 'url' : 'mediaId'}]`);
 
-  if (filePath) {
-    resolvedId = await uploadMedia(filePath, mimeType);
-    minioData  = await storeOutboundInMinIO(filePath, mimeType);
+    const stored = await storeOutboundMedia({ filePath, url }, mimeType, 'video');
+
+    let resolvedId = mediaId;
+    if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
+    if (!resolvedId && !url) throw new Error('sendVideo: provide url, mediaId, or filePath');
+
+    const videoObj = resolvedId ? { id: resolvedId } : { link: url };
+    if (caption) videoObj.caption = caption;
+    const res       = await postMessage({ messaging_product: 'whatsapp', to, type: 'video', video: videoObj });
+    const messageId = extractMessageId(res, 'video');
+
+    await upsertContact(to);
+    await saveOutbound(to, 'video', messageId, {
+      body:  caption,
+      media: { mediaId: resolvedId, mimeType, caption, ...stored },
+    });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendVideo(${to}):`, err.message);
+    throw err;
   }
-
-  const videoObj = resolvedId ? { id: resolvedId } : { link: url };
-  if (caption) videoObj.caption = caption;
-
-  const res = await postMessage({ messaging_product: 'whatsapp', to, type: 'video', video: videoObj });
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'video', messageId, {
-    body:  caption,
-    media: { mediaId: resolvedId, mimeType, caption, ...minioData },
-  });
-  return res;
 }
 
 // ─── 4. Audio ─────────────────────────────────────────────────────────────────
 export async function sendAudio(to, { url, mediaId, filePath, mimeType = 'audio/mpeg' }) {
-  let resolvedId = mediaId;
-  let minioData  = {};
+  try {
+    console.log(`📤 sendAudio → ${to}  [${filePath ? 'file' : url ? 'url' : 'mediaId'}]`);
 
-  if (filePath) {
-    resolvedId = await uploadMedia(filePath, mimeType);
-    minioData  = await storeOutboundInMinIO(filePath, mimeType);
+    const stored = await storeOutboundMedia({ filePath, url }, mimeType, 'audio');
+
+    let resolvedId = mediaId;
+    if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
+    if (!resolvedId && !url) throw new Error('sendAudio: provide url, mediaId, or filePath');
+
+    const audioObj = resolvedId ? { id: resolvedId } : { link: url };
+    const res       = await postMessage({ messaging_product: 'whatsapp', to, type: 'audio', audio: audioObj });
+    const messageId = extractMessageId(res, 'audio');
+
+    await upsertContact(to);
+    await saveOutbound(to, 'audio', messageId, {
+      media: { mediaId: resolvedId, mimeType, ...stored },
+    });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendAudio(${to}):`, err.message);
+    throw err;
   }
-
-  const audioObj = resolvedId ? { id: resolvedId } : { link: url };
-
-  const res = await postMessage({ messaging_product: 'whatsapp', to, type: 'audio', audio: audioObj });
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'audio', messageId, {
-    media: { mediaId: resolvedId, mimeType, ...minioData },
-  });
-  return res;
 }
 
 // ─── 5. Document ──────────────────────────────────────────────────────────────
 export async function sendDocument(to, { url, mediaId, caption = '', fileName = '', filePath, mimeType = 'application/octet-stream' }) {
-  let resolvedId   = mediaId;
-  let resolvedName = fileName;
-  let minioData    = {};
+  try {
+    console.log(`📤 sendDocument → ${to}  [${filePath ? 'file' : url ? 'url' : 'mediaId'}]`);
 
-  if (filePath) {
-    resolvedId   = await uploadMedia(filePath, mimeType);
-    resolvedName = resolvedName || path.basename(filePath);
-    minioData    = await storeOutboundInMinIO(filePath, mimeType);
+    const stored = await storeOutboundMedia({ filePath, url }, mimeType, 'document');
+
+    let resolvedId   = mediaId;
+    let resolvedName = fileName;
+    if (filePath) {
+      resolvedId   = await uploadMedia(filePath, mimeType);
+      resolvedName = resolvedName || path.basename(filePath);
+    }
+    if (!resolvedId && !url) throw new Error('sendDocument: provide url, mediaId, or filePath');
+
+    const docObj = resolvedId ? { id: resolvedId } : { link: url };
+    if (caption)      docObj.caption  = caption;
+    if (resolvedName) docObj.filename = resolvedName;
+
+    const res       = await postMessage({ messaging_product: 'whatsapp', to, type: 'document', document: docObj });
+    const messageId = extractMessageId(res, 'document');
+
+    await upsertContact(to);
+    await saveOutbound(to, 'document', messageId, {
+      body:  caption,
+      media: { mediaId: resolvedId, mimeType, fileName: resolvedName, caption, ...stored },
+    });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendDocument(${to}):`, err.message);
+    throw err;
   }
-
-  const docObj = resolvedId ? { id: resolvedId } : { link: url };
-  if (caption)      docObj.caption  = caption;
-  if (resolvedName) docObj.filename = resolvedName;
-
-  const res = await postMessage({ messaging_product: 'whatsapp', to, type: 'document', document: docObj });
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'document', messageId, {
-    body:  caption,
-    media: { mediaId: resolvedId, mimeType, fileName: resolvedName, caption, ...minioData },
-  });
-  return res;
 }
 
 // ─── 6. Sticker ───────────────────────────────────────────────────────────────
 export async function sendSticker(to, { url, mediaId }) {
-  const stickerObj = mediaId ? { id: mediaId } : { link: url };
-  const res = await postMessage({ messaging_product: 'whatsapp', to, type: 'sticker', sticker: stickerObj });
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'sticker', messageId, {
-    media: { mediaId, mimeType: 'image/webp' },
-  });
-  return res;
+  try {
+    console.log(`📤 sendSticker → ${to}`);
+    const stickerObj = mediaId ? { id: mediaId } : { link: url };
+    const res        = await postMessage({ messaging_product: 'whatsapp', to, type: 'sticker', sticker: stickerObj });
+    const messageId  = extractMessageId(res, 'sticker');
+    await upsertContact(to);
+    await saveOutbound(to, 'sticker', messageId, { media: { mediaId, mimeType: 'image/webp' } });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendSticker(${to}):`, err.message);
+    throw err;
+  }
 }
 
 // ─── 7. Location ──────────────────────────────────────────────────────────────
 export async function sendLocation(to, { latitude, longitude, name = '', address = '' }) {
-  const res = await postMessage({
-    messaging_product: 'whatsapp',
-    to,
-    type:     'location',
-    location: { latitude, longitude, name, address },
-  });
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'location', messageId, {
-    location: { latitude, longitude, name, address },
-  });
-  return res;
+  try {
+    console.log(`📤 sendLocation → ${to}`);
+    const res       = await postMessage({ messaging_product: 'whatsapp', to, type: 'location', location: { latitude, longitude, name, address } });
+    const messageId = extractMessageId(res, 'location');
+    await upsertContact(to);
+    await saveOutbound(to, 'location', messageId, { location: { latitude, longitude, name, address } });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendLocation(${to}):`, err.message);
+    throw err;
+  }
 }
 
 // ─── 8. Template ──────────────────────────────────────────────────────────────
-/**
- * components example:
- * [
- *   { type: 'header', parameters: [{ type: 'image', image: { link: 'https://...' } }] },
- *   { type: 'body',   parameters: [{ type: 'text', text: 'John' }] },
- *   { type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: 'ABC123' }] }
- * ]
- */
 export async function sendTemplate(to, templateName, languageCode = 'en_US', components = []) {
-  const res = await postMessage({
-    messaging_product: 'whatsapp',
-    to,
-    type: 'template',
-    template: { name: templateName, language: { code: languageCode }, components },
-  });
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'template', messageId, {
-    body:       `[template: ${templateName}]`,
-    rawPayload: { templateName, languageCode, components },
-  });
-  return res;
+  try {
+    console.log(`📤 sendTemplate "${templateName}" → ${to}`);
+    const res       = await postMessage({ messaging_product: 'whatsapp', to, type: 'template', template: { name: templateName, language: { code: languageCode }, components } });
+    const messageId = extractMessageId(res, 'template');
+    await upsertContact(to);
+    await saveOutbound(to, 'template', messageId, { body: `[template: ${templateName}]`, rawPayload: { templateName, languageCode, components } });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendTemplate(${to}):`, err.message);
+    throw err;
+  }
 }
 
-// ─── 9. Interactive buttons (up to 3) ─────────────────────────────────────────
+// ─── 9. Buttons ───────────────────────────────────────────────────────────────
 export async function sendButtons(to, bodyText, buttons, headerText = '', footerText = '') {
-  const payload = {
-    messaging_product: 'whatsapp',
-    to,
-    type: 'interactive',
-    interactive: {
-      type:   'button',
-      body:   { text: bodyText },
-      action: {
-        buttons: buttons.map(b => ({ type: 'reply', reply: { id: b.id, title: b.title } })),
-      },
-    },
-  };
-  if (headerText) payload.interactive.header = { type: 'text', text: headerText };
-  if (footerText) payload.interactive.footer = { text: footerText };
-
-  const res = await postMessage(payload);
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'interactive', messageId, {
-    body:       bodyText,
-    rawPayload: { type: 'button', headerText, bodyText, footerText, buttons },
-  });
-  return res;
+  try {
+    console.log(`📤 sendButtons → ${to}`);
+    const payload = {
+      messaging_product: 'whatsapp', to, type: 'interactive',
+      interactive: { type: 'button', body: { text: bodyText }, action: { buttons: buttons.map(b => ({ type: 'reply', reply: { id: b.id, title: b.title } })) } },
+    };
+    if (headerText) payload.interactive.header = { type: 'text', text: headerText };
+    if (footerText) payload.interactive.footer = { text: footerText };
+    const res       = await postMessage(payload);
+    const messageId = extractMessageId(res, 'buttons');
+    await upsertContact(to);
+    await saveOutbound(to, 'interactive', messageId, { body: bodyText, rawPayload: { type: 'button', headerText, bodyText, footerText, buttons } });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendButtons(${to}):`, err.message);
+    throw err;
+  }
 }
 
-// ─── 10. Interactive list ─────────────────────────────────────────────────────
+// ─── 10. List ─────────────────────────────────────────────────────────────────
 export async function sendList(to, bodyText, buttonLabel, sections) {
-  const res = await postMessage({
-    messaging_product: 'whatsapp',
-    to,
-    type: 'interactive',
-    interactive: {
-      type:   'list',
-      body:   { text: bodyText },
-      action: { button: buttonLabel, sections },
-    },
-  });
-  const messageId = res.messages?.[0]?.id;
-  await upsertContact(to);
-  await saveOutbound(to, 'interactive', messageId, {
-    body:       bodyText,
-    rawPayload: { type: 'list', bodyText, buttonLabel, sections },
-  });
-  return res;
+  try {
+    console.log(`📤 sendList → ${to}`);
+    const res       = await postMessage({ messaging_product: 'whatsapp', to, type: 'interactive', interactive: { type: 'list', body: { text: bodyText }, action: { button: buttonLabel, sections } } });
+    const messageId = extractMessageId(res, 'list');
+    await upsertContact(to);
+    await saveOutbound(to, 'interactive', messageId, { body: bodyText, rawPayload: { type: 'list', bodyText, buttonLabel, sections } });
+    return res;
+  } catch (err) {
+    console.error(`❌ sendList(${to}):`, err.message);
+    throw err;
+  }
 }
 
-// ─── 11. Mark read (blue ticks) ───────────────────────────────────────────────
+// ─── 11. Mark read ────────────────────────────────────────────────────────────
 export async function markRead(messageId) {
-  await axios.post(
-    `${BASE_URL()}/messages`,
-    { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
-    { headers: { ...authHeader(), 'Content-Type': 'application/json' } }
-  );
-  await Message.findOneAndUpdate({ messageId }, { $set: { status: 'read' } });
-}
-
-// ─── 12. Upload file to WhatsApp CDN → reusable media ID ─────────────────────
-export async function uploadMedia(filePath, mimeType) {
-  const form = new FormData();
-  form.append('messaging_product', 'whatsapp');
-  form.append('file', fs.createReadStream(filePath), {
-    contentType: mimeType,
-    filename:    path.basename(filePath),
-  });
-  const { data } = await axios.post(
-    `${BASE_URL()}/media`,
-    form,
-    { headers: { ...authHeader(), ...form.getHeaders() } }
-  );
-  return data.id;
+  try {
+    await axios.post(`${BASE_URL()}/messages`, { messaging_product: 'whatsapp', status: 'read', message_id: messageId }, { headers: { ...authHeader(), 'Content-Type': 'application/json' } });
+    await Message.findOneAndUpdate({ messageId }, { $set: { status: 'read' } });
+  } catch (err) {
+    console.error(`⚠️  markRead(${messageId}):`, err.message);
+  }
 }

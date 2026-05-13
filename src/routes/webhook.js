@@ -1,12 +1,13 @@
 /**
  * webhook.js
  * ─────────────────────────────────────────────────────────────────────────────
- * GET  /webhook  — Meta webhook verification challenge
- * POST /webhook  — Receive all inbound events and status updates
+ * GET  /webhook  — Meta verification
+ * POST /webhook  — All inbound events (messages + status updates)
  *
- * Supported inbound message types handled:
- *   text, image, video, audio, document, sticker,
- *   location, contacts, button, interactive, reaction, unsupported
+ * INBOUND MEDIA FLOW (customer → business):
+ *   1. Message saved to MongoDB immediately (with mediaId, mimeType)
+ *   2. Media downloaded from WhatsApp CDN asynchronously
+ *   3. Stored in MinIO (or local) — minioKey + minioUrl updated in MongoDB
  */
 
 import express from 'express';
@@ -17,28 +18,22 @@ import { markRead } from '../services/whatsappService.js';
 
 const router = express.Router();
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /webhook  — Meta verification handshake
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── GET /webhook — Meta verification ────────────────────────────────────────
 router.get('/', (req, res) => {
   const mode      = req.query['hub.mode'];
   const token     = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
   if (mode === 'subscribe' && token === process.env.WA_VERIFY_TOKEN) {
-    console.log('✅ Webhook verified by Meta');
+    console.log('✅ Webhook verified');
     return res.status(200).send(challenge);
   }
-  console.warn('⚠️  Webhook verification failed — token mismatch');
+  console.warn('⚠️  Webhook verify failed — token mismatch');
   res.sendStatus(403);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /webhook  — Inbound events
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── POST /webhook — Inbound events ──────────────────────────────────────────
 router.post('/', async (req, res) => {
-  // IMPORTANT: Respond 200 immediately. If Meta doesn't get a 200 quickly
-  // it will retry — which causes duplicate processing.
+  // Always respond 200 immediately — Meta retries if it doesn't get one fast
   res.sendStatus(200);
 
   try {
@@ -50,43 +45,40 @@ router.post('/', async (req, res) => {
         const value = change.value;
         if (!value) continue;
 
-        // ── Process incoming messages ─────────────────────────────────────
-        for (const msg of value.messages || []) {
-          await handleInboundMessage(msg, value);
-        }
-
-        // ── Process status updates ────────────────────────────────────────
-        for (const status of value.statuses || []) {
-          await handleStatusUpdate(status);
-        }
+        for (const msg of value.messages || [])   await handleInbound(msg, value);
+        for (const status of value.statuses || []) await handleStatus(status);
       }
     }
   } catch (err) {
-    console.error('❌ Webhook processing error:', err);
+    console.error('❌ Webhook error:', err.message);
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handle a single inbound message
+// Handle inbound message
 // ─────────────────────────────────────────────────────────────────────────────
-async function handleInboundMessage(msg, value) {
+async function handleInbound(msg, value) {
   const phoneNumberId = value.metadata?.phone_number_id;
   const contactInfo   = value.contacts?.find(c => c.wa_id === msg.from);
   const contactName   = contactInfo?.profile?.name || '';
+  const isMedia       = ['image','video','audio','document','sticker'].includes(msg.type);
 
-  // ── Upsert contact ────────────────────────────────────────────────────────
-  const isMedia = ['image','video','audio','document','sticker'].includes(msg.type);
-  await Contact.findOneAndUpdate(
-    { phone: msg.from },
-    {
-      $set:  { phone: msg.from, waId: msg.from, name: contactName, lastSeen: new Date() },
-      $inc:  { messageCount: 1, ...(isMedia ? { mediaCount: 1 } : {}) },
-      $setOnInsert: { firstSeen: new Date() },
-    },
-    { upsert: true, new: true }
-  );
+  // ── Upsert contact ─────────────────────────────────────────────────────────
+  try {
+    await Contact.findOneAndUpdate(
+      { phone: msg.from },
+      {
+        $set:         { phone: msg.from, waId: msg.from, name: contactName, lastSeen: new Date() },
+        $inc:         { messageCount: 1, ...(isMedia ? { mediaCount: 1 } : {}) },
+        $setOnInsert: { firstSeen: new Date() },
+      },
+      { upsert: true, new: true }
+    );
+  } catch (err) {
+    console.error(`⚠️  Contact upsert failed (${msg.from}):`, err.message);
+  }
 
-  // ── Build message document ────────────────────────────────────────────────
+  // ── Build base document ────────────────────────────────────────────────────
   const doc = {
     messageId:        msg.id,
     direction:        'inbound',
@@ -100,133 +92,63 @@ async function handleInboundMessage(msg, value) {
     rawPayload:       msg,
   };
 
-  // ── Type-specific extraction ──────────────────────────────────────────────
+  // ── Type-specific fields ───────────────────────────────────────────────────
   switch (msg.type) {
 
     case 'text':
       doc.body = msg.text?.body || '';
-      console.log(`📩 TEXT  from ${msg.from}: ${doc.body}`);
+      console.log(`📩 TEXT    from ${msg.from}: ${doc.body}`);
       break;
 
     case 'image':
     case 'sticker': {
       const m = msg[msg.type];
-      doc.media = {
-        mediaId:  m.id,
-        mimeType: m.mime_type,
-        sha256:   m.sha256,
-        caption:  m.caption || '',
-      };
-      doc.body = m.caption || '';
-      console.log(`📸 ${msg.type.toUpperCase()} from ${msg.from} — id: ${m.id}`);
-
-      // Download media asynchronously (don't block webhook response)
-      downloadAndStoreMedia(m.id, m.mime_type)
-        .then(stored => Message.findOneAndUpdate(
-          { messageId: msg.id },
-          { $set: { 'media.localPath': stored.localPath, 'media.minioKey': stored.minioKey,
-                    'media.minioUrl': stored.minioUrl, 'media.fileSize': stored.fileSize,
-                    'media.downloadedAt': stored.downloadedAt } }
-        ))
-        .catch(e => console.error(`❌ Media download failed (${m.id}):`, e.message));
+      doc.media = { mediaId: m.id, mimeType: m.mime_type, sha256: m.sha256, caption: m.caption || '' };
+      doc.body  = m.caption || '';
+      console.log(`📸 ${msg.type.toUpperCase()} from ${msg.from} — mediaId: ${m.id}`);
       break;
     }
 
     case 'video': {
       const m = msg.video;
-      doc.media = {
-        mediaId:  m.id,
-        mimeType: m.mime_type,
-        sha256:   m.sha256,
-        caption:  m.caption || '',
-      };
-      doc.body = m.caption || '';
-      console.log(`🎥 VIDEO  from ${msg.from} — id: ${m.id}`);
-
-      downloadAndStoreMedia(m.id, m.mime_type)
-        .then(stored => Message.findOneAndUpdate(
-          { messageId: msg.id },
-          { $set: { 'media.localPath': stored.localPath, 'media.minioKey': stored.minioKey,
-                    'media.minioUrl': stored.minioUrl, 'media.fileSize': stored.fileSize,
-                    'media.downloadedAt': stored.downloadedAt } }
-        ))
-        .catch(e => console.error(`❌ Media download failed (${m.id}):`, e.message));
-
-        console.log(`⏬ Downloading media ${m.id}...`);
-        console.log('media.localPath:', stored.localPath, ' - media.minioKey:', stored.minioKey,
-                    'media.minioUrl:', stored.minioUrl, ' - media.fileSize:', stored.fileSize,
-                    'media.downloadedAt:', stored.downloadedAt);
+      doc.media = { mediaId: m.id, mimeType: m.mime_type, sha256: m.sha256, caption: m.caption || '' };
+      doc.body  = m.caption || '';
+      console.log(`🎥 VIDEO   from ${msg.from} — mediaId: ${m.id}`);
       break;
     }
 
     case 'audio': {
       const m = msg.audio;
-      doc.media = {
-        mediaId:  m.id,
-        mimeType: m.mime_type,
-        sha256:   m.sha256,
-      };
-      console.log(`🔊 AUDIO  from ${msg.from} — id: ${m.id} (voice: ${m.voice})`);
-
-      downloadAndStoreMedia(m.id, m.mime_type)
-        .then(stored => Message.findOneAndUpdate(
-          { messageId: msg.id },
-          { $set: { 'media.localPath': stored.localPath, 'media.minioKey': stored.minioKey,
-                    'media.minioUrl': stored.minioUrl, 'media.fileSize': stored.fileSize,
-                    'media.downloadedAt': stored.downloadedAt } }
-        ))
-        .catch(e => console.error(`❌ Media download failed (${m.id}):`, e.message));
+      doc.media = { mediaId: m.id, mimeType: m.mime_type, sha256: m.sha256 };
+      console.log(`🔊 AUDIO   from ${msg.from} — mediaId: ${m.id} voice=${m.voice}`);
       break;
     }
 
     case 'document': {
       const m = msg.document;
-      doc.media = {
-        mediaId:  m.id,
-        mimeType: m.mime_type,
-        sha256:   m.sha256,
-        fileName: m.filename || '',
-        caption:  m.caption  || '',
-      };
-      doc.body = m.caption || m.filename || '';
-      console.log(`📄 DOC    from ${msg.from} — ${m.filename || m.id}`);
-
-      downloadAndStoreMedia(m.id, m.mime_type, m.filename)
-        .then(stored => Message.findOneAndUpdate(
-          { messageId: msg.id },
-          { $set: { 'media.localPath': stored.localPath, 'media.minioKey': stored.minioKey,
-                    'media.minioUrl': stored.minioUrl, 'media.fileSize': stored.fileSize,
-                    'media.downloadedAt': stored.downloadedAt } }
-        ))
-        .catch(e => console.error(`❌ Media download failed (${m.id}):`, e.message));
+      doc.media = { mediaId: m.id, mimeType: m.mime_type, sha256: m.sha256, fileName: m.filename || '', caption: m.caption || '' };
+      doc.body  = m.caption || m.filename || '';
+      console.log(`📄 DOC     from ${msg.from} — ${m.filename || m.id}`);
       break;
     }
 
     case 'location':
-      doc.location = {
-        latitude:  msg.location.latitude,
-        longitude: msg.location.longitude,
-        name:      msg.location.name    || '',
-        address:   msg.location.address || '',
-      };
+      doc.location = { latitude: msg.location.latitude, longitude: msg.location.longitude, name: msg.location.name || '', address: msg.location.address || '' };
       console.log(`📍 LOCATION from ${msg.from}: ${msg.location.latitude},${msg.location.longitude}`);
       break;
 
     case 'contacts':
-      // Array of vCard-style contacts
       doc.body = JSON.stringify(msg.contacts);
       console.log(`👤 CONTACTS from ${msg.from}: ${msg.contacts?.length} contact(s)`);
       break;
 
     case 'button':
-      // User tapped a template button
       doc.buttonReply = { id: msg.button?.payload, title: msg.button?.text };
       doc.body        = msg.button?.text || '';
-      console.log(`🔘 BUTTON from ${msg.from}: "${msg.button?.text}"`);
+      console.log(`🔘 BUTTON  from ${msg.from}: "${msg.button?.text}"`);
       break;
 
     case 'interactive': {
-      // User tapped a reply button or list item
       const ir = msg.interactive;
       if (ir?.type === 'button_reply') {
         doc.buttonReply = { id: ir.button_reply.id, title: ir.button_reply.title };
@@ -247,32 +169,62 @@ async function handleInboundMessage(msg, value) {
 
     default:
       doc.type = 'unsupported';
-      doc.body = `[unsupported type: ${msg.type}]`;
-      console.log(`❓ UNSUPPORTED type "${msg.type}" from ${msg.from}`);
+      doc.body = `[unsupported: ${msg.type}]`;
+      console.log(`❓ UNSUPPORTED "${msg.type}" from ${msg.from}`);
   }
 
-  // ── Save to MongoDB (upsert by messageId to avoid duplicates) ────────────
-  await Message.findOneAndUpdate(
-    { messageId: msg.id },
-    { $set: doc },
-    { upsert: true, new: true }
-  );
+  // ── Save to MongoDB immediately ────────────────────────────────────────────
+  try {
+    await Message.findOneAndUpdate(
+      { messageId: msg.id },
+      { $set: doc },
+      { upsert: true, new: true }
+    );
+    console.log(`✅ DB saved inbound ${msg.type} from ${msg.from} [${msg.id}]`);
+  } catch (err) {
+    console.error(`❌ DB save failed (${msg.id}):`, err.message);
+    return; // Don't proceed to media download if DB save failed
+  }
 
-  // ── Optionally auto-mark as read ─────────────────────────────────────────
-  // await markRead(msg.id);
+  // ── Download + store media in MinIO/local (async, after DB save) ───────────
+  if (isMedia && doc.media?.mediaId) {
+    downloadAndStoreMedia(doc.media.mediaId, doc.media.mimeType, doc.media.fileName || null)
+      .then(async (stored) => {
+        // Build the storage update — only set fields that exist in the result
+        const mediaUpdate = {};
+        if (stored.localPath)    mediaUpdate['media.localPath']    = stored.localPath;
+        if (stored.minioKey)     mediaUpdate['media.minioKey']     = stored.minioKey;
+        if (stored.minioUrl)     mediaUpdate['media.minioUrl']     = stored.minioUrl;
+        if (stored.fileSize)     mediaUpdate['media.fileSize']     = stored.fileSize;
+        if (stored.downloadedAt) mediaUpdate['media.downloadedAt'] = stored.downloadedAt;
+
+        if (Object.keys(mediaUpdate).length > 0) {
+          await Message.findOneAndUpdate(
+            { messageId: msg.id },
+            { $set: mediaUpdate }
+          );
+          console.log(`✅ DB updated media storage for [${msg.id}]:`, stored.minioUrl || stored.localPath);
+        }
+      })
+      .catch(err => console.error(`❌ Media download/store failed (${doc.media.mediaId}):`, err.message));
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handle a delivery/read status update
+// Handle status update (sent → delivered → read → failed)
 // ─────────────────────────────────────────────────────────────────────────────
-async function handleStatusUpdate(status) {
-  const update = { status: status.status };
-  if (status.errors?.[0]) {
-    update.errorCode    = status.errors[0].code?.toString();
-    update.errorMessage = status.errors[0].title;
+async function handleStatus(status) {
+  try {
+    const update = { status: status.status };
+    if (status.errors?.[0]) {
+      update.errorCode    = status.errors[0].code?.toString();
+      update.errorMessage = status.errors[0].title;
+    }
+    await Message.findOneAndUpdate({ messageId: status.id }, { $set: update });
+    console.log(`📬 STATUS [${status.id}] → ${status.status}`);
+  } catch (err) {
+    console.error(`⚠️  Status update failed (${status.id}):`, err.message);
   }
-  await Message.findOneAndUpdate({ messageId: status.id }, { $set: update });
-  console.log(`📬 STATUS ${status.id} → ${status.status}`);
 }
 
 export default router;
