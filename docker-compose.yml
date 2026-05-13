@@ -1,10 +1,19 @@
 version: '3.9'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Local development stack:
-#   mongodb  → mongodb://localhost:27017
-#   minio    → http://localhost:9000  (API)
-#              http://localhost:9001  (Console UI — open in browser)
+# Local development + production-ready stack:
+#
+#   mongodb  → mongodb://localhost:27017  (internal)
+#
+#   minio    INTERNAL  → http://minio:9000        (between containers)
+#            INTERNAL  → http://localhost:9000     (from host machine)
+#            PUBLIC    → set MINIO_PUBLIC_URL in .env to your public IP/domain
+#                        e.g. http://<your-server-public-ip>:9000
+#                             https://media.yourdomain.com  (behind nginx/caddy)
+#
+#   MinIO Console UI → http://localhost:9001
+#
+# ─── Port 9000 must be open in your firewall/security group for public access ─
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -25,19 +34,44 @@ services:
     container_name: wa_minio
     restart: unless-stopped
     ports:
-      - "9000:9000"   # S3-compatible API
-      - "9001:9001"   # MinIO Console (web UI)
+      - "9000:9000"   # S3-compatible API — expose to internet for public media URLs
+      - "9001:9001"   # MinIO Console (web UI) — keep private / behind firewall
     volumes:
       - minio_data:/data
     environment:
       MINIO_ROOT_USER:     minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
+      # Tell MinIO its own public hostname so presigned URLs use the right domain.
+      # Set this to your server's public IP or domain (no protocol, no port if default).
+      # e.g.  MINIO_SERVER_URL: https://media.yourdomain.com
+      #       MINIO_SERVER_URL: http://203.0.113.10:9000
+      MINIO_SERVER_URL: http://localhost:9000   # ← change to your public IP/domain
     command: server /data --console-address ":9001"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
       timeout: 5s
       retries: 5
+
+  # ── Optional: Node.js app in the same compose network ──────────────────────
+  # Uncomment to run the app inside Docker alongside MinIO + MongoDB.
+  # app:
+  #   build: .
+  #   container_name: wa_app
+  #   restart: unless-stopped
+  #   ports:
+  #     - "3000:3000"
+  #   depends_on:
+  #     - mongodb
+  #     - minio
+  #   environment:
+  #     MONGODB_URI:        mongodb://mongodb:27017/whatsapp_capture
+  #     MINIO_INTERNAL_URL: http://minio:9000          # ← Docker service name
+  #     MINIO_PUBLIC_URL:   http://YOUR_PUBLIC_IP:9000 # ← internet-accessible
+  #     MINIO_ACCESS_KEY:   minioadmin
+  #     MINIO_SECRET_KEY:   minioadmin
+  #     MINIO_BUCKET:       whatsapp-media
+  #     MEDIA_STORAGE:      minio
 
 volumes:
   mongo_data:
