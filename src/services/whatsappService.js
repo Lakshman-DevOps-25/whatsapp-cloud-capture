@@ -58,6 +58,7 @@ async function upsertContact(phone) {
 
 // ─── Save outbound message to MongoDB ────────────────────────────────────────
 async function saveOutbound(to, type, messageId, fields = {}) {
+  console.log("In saveOutbound function");
   try {
     const doc = {
       messageId,
@@ -80,6 +81,7 @@ async function saveOutbound(to, type, messageId, fields = {}) {
       { $set: doc },
       { upsert: true, new: true }
     );
+    console.log("Saved in Message table");
 
     console.log(`📤 OUTBOUND ${type} → ${to} [${messageId}]`);
   } catch (err) {
