@@ -83,7 +83,7 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
     direction:   'outbound',
     from:        fromPhone,
     to:          toPhone,
-    // type:        type,
+    type,
     waTimestamp: new Date(),
     status:      'sent',
   };
