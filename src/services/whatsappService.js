@@ -105,7 +105,7 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
         waTimestamp: new Date(),
         status:      'sent',
       },
-      { upsert: true, new: true }
+      { upsert: false, new: true }
     );
     console.log(`   ✅ DB saved: _id=${saved._id} | from=${saved.from} | to=${saved.to}`);
   } catch (dbErr) {
