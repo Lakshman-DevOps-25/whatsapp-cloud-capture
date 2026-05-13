@@ -138,6 +138,7 @@ router.post('/send/text', async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error(`[POST /send/text] ERROR:`, err.message);
+    console.error(`[ROUTE ERROR] ${err.message}`, err.stack);
     res.status(500).json({ error: err.message });
   }
 });
@@ -170,6 +171,7 @@ router.post('/send/image', upload.single('media'), async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error(`[POST /send/image] ERROR:`, err.message);
+    console.error(`[ROUTE ERROR] ${err.message}`, err.stack);
     res.status(500).json({ error: err.message });
   }
 });
@@ -202,6 +204,7 @@ router.post('/send/video', upload.single('media'), async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error(`[POST /send/video] ERROR:`, err.message);
+    console.error(`[ROUTE ERROR] ${err.message}`, err.stack);
     res.status(500).json({ error: err.message });
   }
 });
@@ -233,6 +236,7 @@ router.post('/send/audio', upload.single('media'), async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error(`[POST /send/audio] ERROR:`, err.message);
+    console.error(`[ROUTE ERROR] ${err.message}`, err.stack);
     res.status(500).json({ error: err.message });
   }
 });
@@ -267,6 +271,7 @@ router.post('/send/document', upload.single('media'), async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error(`[POST /send/document] ERROR:`, err.message);
+    console.error(`[ROUTE ERROR] ${err.message}`, err.stack);
     res.status(500).json({ error: err.message });
   }
 });
