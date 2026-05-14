@@ -250,16 +250,11 @@ async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
 async function handleStatus(status) {
   try {
     const update = { status: status.status };
-
     if (status.errors?.[0]) {
       update.errorCode    = status.errors[0].code?.toString();
       update.errorMessage = status.errors[0].title;
     }
 
-    // Only update — never create a placeholder.
-    // sendAndSave() is the only writer of outbound records.
-    // status=sent may arrive before sendAndSave writes — that's OK, just skip it.
-    // status=delivered and status=read always arrive after sendAndSave, so they update correctly.
     const col    = mongoose.connection.db.collection('messages');
     const result = await col.updateOne(
       { messageId: status.id },
@@ -267,9 +262,23 @@ async function handleStatus(status) {
     );
 
     if (result.matchedCount > 0) {
-      console.log(`📬 STATUS [${status.id}] → ${status.status}`);
+      console.log(`📬 STATUS [${status.id.slice(-10)}] → ${status.status}`);
+    } else if (status.status === 'sent') {
+      // status=sent always arrives ~50ms before saveMessage completes (~200ms)
+      // Retry after 1.5s — saveMessage will have written the record by then
+      setTimeout(async () => {
+        try {
+          const r = await col.updateOne(
+            { messageId: status.id },
+            { $set: { ...update, updatedAt: new Date() } }
+          );
+          if (r.matchedCount > 0) {
+            console.log(`📬 STATUS [${status.id.slice(-10)}] → sent (applied on retry)`);
+          }
+        } catch (_) {}
+      }, 1500);
     } else {
-      console.log(`📬 STATUS [${status.id}] → ${status.status} (no record yet — sendAndSave will write it)`);
+      console.log(`📬 STATUS [${status.id.slice(-10)}] → ${status.status} (record not found)`);
     }
   } catch (err) {
     console.error(`⚠️  Status update(${status.id}): ${err.message}`);
