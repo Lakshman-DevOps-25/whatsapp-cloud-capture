@@ -54,7 +54,7 @@ router.get('/', async (req, res) => {
     if (req.query.type)      filter.type      = req.query.type;
     if (req.query.direction) filter.direction = req.query.direction;
     if (req.query.status)    filter.status    = req.query.status;
-    if (req.query.body)      filter.body      = { $regex: req.query.body, $options: 'i' };
+    if (req.query.body)      filter.body      = req.query.text.body;
     const [messages, total] = await Promise.all([
       Message.find(filter).sort({ waTimestamp: -1 }).skip((page - 1) * limit).limit(limit).lean(),
       Message.countDocuments(filter),
@@ -72,7 +72,7 @@ router.get('/outbound', async (req, res) => {
     if (req.query.type)   filter.type   = req.query.type;
     if (req.query.status) filter.status = req.query.status;
     if (req.query.to)     filter.to     = req.query.to;
-    if (req.query.body)   filter.body   = { $regex: req.query.body, $options: 'i' };
+    if (req.query.body)   filter.body   = req.query.text.body;
     const [messages, total] = await Promise.all([
       Message.find(filter).sort({ waTimestamp: -1 }).skip((page - 1) * limit).limit(limit).lean(),
       Message.countDocuments(filter),
