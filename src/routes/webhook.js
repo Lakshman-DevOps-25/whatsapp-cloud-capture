@@ -23,9 +23,10 @@
  * BEFORE the message is sent to Meta. Webhook only updates their status.
  */
 
-import express from 'express';
-import Message from '../models/Message.js';
-import Contact from '../models/Contact.js';
+import express  from 'express';
+import mongoose from 'mongoose';
+import Message  from '../models/Message.js';
+import Contact  from '../models/Contact.js';
 import { downloadAndStoreMedia } from '../services/mediaService.js';
 
 const router = express.Router();
@@ -196,16 +197,14 @@ async function handleInbound(msg, value) {
       doc.body = `[unsupported: ${msg.type}]`;
   }
 
-  // ── Save to MongoDB via raw driver ───────────────────────────────────────
+  // ── Save to MongoDB via native driver ────────────────────────────────────
   console.log(`   💾 Saving: messageId=${msg.id} type=${doc.type} direction=inbound`);
   try {
     const now = new Date();
-    await Message.collection.updateOne(
+    const col = mongoose.connection.db.collection('messages');
+    await col.updateOne(
       { messageId: msg.id },
-      {
-        $set: { ...doc, updatedAt: now },
-        $setOnInsert: { createdAt: now }
-      },
+      { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
       { upsert: true }
     );
     console.log(`   ✅ DB saved inbound: type=${doc.type} from=${doc.from} to=${doc.to}`);
@@ -233,7 +232,8 @@ async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
     if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
 
     if (Object.keys(update).length > 0) {
-      await Message.findOneAndUpdate({ messageId }, { $set: update });
+      const col = mongoose.connection.db.collection('messages');
+      await col.updateOne({ messageId }, { $set: update });
       console.log(`   ✅ Inbound media stored and DB updated: ${stored.minioUrl || stored.localPath}`);
     }
   } catch (err) {
@@ -260,7 +260,8 @@ async function handleStatus(status) {
     // sendAndSave() is the only writer of outbound records.
     // status=sent may arrive before sendAndSave writes — that's OK, just skip it.
     // status=delivered and status=read always arrive after sendAndSave, so they update correctly.
-    const result = await Message.collection.updateOne(
+    const col    = mongoose.connection.db.collection('messages');
+    const result = await col.updateOne(
       { messageId: status.id },
       { $set: { ...update, updatedAt: new Date() } }
     );

@@ -1,7 +1,13 @@
+/**
+ * whatsappService.js — OUTBOUND: business → customer
+ * Uses raw MongoDB driver (Message.collection) to avoid Mongoose 'type' field quirk.
+ */
+
 import axios    from 'axios';
 import fs       from 'fs';
 import path     from 'path';
 import FormData from 'form-data';
+import mongoose from 'mongoose';
 import Message  from '../models/Message.js';
 import Contact  from '../models/Contact.js';
 import { mediaTypeFolder, downloadUrlAndStore, storeLocalFile } from './mediaService.js';
@@ -25,7 +31,11 @@ async function upsertContact(phone) {
   try {
     await Contact.findOneAndUpdate(
       { phone },
-      { $set: { phone, waId: phone, lastSeen: new Date() }, $inc: { messageCount: 1 }, $setOnInsert: { firstSeen: new Date() } },
+      {
+        $set:         { phone, waId: phone, lastSeen: new Date() },
+        $inc:         { messageCount: 1 },
+        $setOnInsert: { firstSeen: new Date() },
+      },
       { upsert: true, new: true }
     );
   } catch (err) {
@@ -33,40 +43,41 @@ async function upsertContact(phone) {
   }
 }
 
-// ─── Save outbound message to MongoDB ────────────────────────────────────────
-// Uses raw MongoDB driver (Message.collection) to avoid Mongoose 'type' keyword conflict.
-async function saveToDb(messageId, direction, fromPhone, toPhone, msgType, status, extraFields) {
+// ─── Direct MongoDB insert/update — bypasses Mongoose schema for 'type' field ─
+async function saveToDb(messageId, fromPhone, toPhone, msgType, msgStatus, extraFields) {
   const now = new Date();
 
-  // Build raw document — no Mongoose schema processing
-  const rawDoc = {
+  // Build raw document with all fields explicitly named
+  const doc = {
     messageId,
-    direction,
+    direction:   'outbound',
     from:        fromPhone,
     to:          toPhone,
-    type:        msgType,   // 'text', 'image', 'video', etc. — stored directly
-    status,
+    type:        msgType,
+    status:      msgStatus,
     waTimestamp: now,
     createdAt:   now,
     updatedAt:   now,
   };
 
-  // Add optional fields only if they have values
-  if (extraFields.body)       rawDoc.body       = extraFields.body;
-  if (extraFields.media)      rawDoc.media      = extraFields.media;
-  if (extraFields.location)   rawDoc.location   = extraFields.location;
-  if (extraFields.rawPayload) rawDoc.rawPayload = extraFields.rawPayload;
+  if (extraFields.body)       doc.body       = extraFields.body;
+  if (extraFields.media)      doc.media      = extraFields.media;
+  if (extraFields.location)   doc.location   = extraFields.location;
+  if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
-  console.log(`   💾 Saving: messageId=${messageId} type=${msgType} direction=${direction} from=${fromPhone} to=${toPhone}`);
+  console.log(`   💾 DB write: messageId=${messageId} type=${msgType} from=${fromPhone} to=${toPhone}`);
 
-  // Use raw collection — no Mongoose validation/casting that drops 'type'
-  await Message.collection.updateOne(
+  // Use native MongoDB driver directly — zero Mongoose processing
+  const db         = mongoose.connection.db;
+  const collection = db.collection('messages');
+
+  await collection.updateOne(
     { messageId },
-    { $set: rawDoc, $setOnInsert: { _id: new (await import('mongoose')).default.Types.ObjectId() } },
+    { $set: doc },
     { upsert: true }
   );
 
-  console.log(`   ✅ DB saved: type=${msgType} from=${fromPhone} to=${toPhone} status=${status}`);
+  console.log(`   ✅ DB write OK: type=${msgType} status=${msgStatus}`);
 }
 
 // ─── Core: send to Meta + save to MongoDB ────────────────────────────────────
@@ -74,32 +85,33 @@ async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
   const toPhone   = (to || '').toString().trim();
   const fromPhone = MY_PHONE();
 
-  console.log(`\n${'─'.repeat(50)}`);
-  console.log(`📤 OUTBOUND ${msgType} | from=${fromPhone} | to=${toPhone}`);
+  console.log(`\n${'═'.repeat(60)}`);
+  console.log(`📤 SEND ${msgType.toUpperCase()} | to=${toPhone} | from=${fromPhone || 'NOT SET'}`);
 
   if (!toPhone)   throw new Error(`"to" is required`);
-  if (!fromPhone) console.warn(`   ⚠️  WA_BUSINESS_PHONE not set in env vars!`);
+  if (!fromPhone) console.warn(`   ⚠️  WA_BUSINESS_PHONE env var not set! Set it in Railway.`);
 
-  // Step 1: Send to Meta API
-  console.log(`   [1] Sending to Meta...`);
+  // 1. Send to Meta
+  console.log(`   [1] Posting to Meta API...`);
   const metaRes       = await postMessage(metaPayload);
   const realMessageId = metaRes?.messages?.[0]?.id;
-  if (!realMessageId) throw new Error(`Meta returned no messageId: ${JSON.stringify(metaRes)}`);
-  console.log(`   [2] Got messageId: ${realMessageId}`);
+  if (!realMessageId) throw new Error(`Meta no messageId: ${JSON.stringify(metaRes)}`);
+  console.log(`   [2] messageId=${realMessageId}`);
 
-  // Step 2: Save to MongoDB
-  console.log(`   [3] Saving to MongoDB...`);
-  await saveToDb(realMessageId, 'outbound', fromPhone, toPhone, msgType, 'sent', extraFields);
-  console.log(`   [4] MongoDB save complete`);
+  // 2. Save to MongoDB
+  console.log(`   [3] Writing to MongoDB...`);
+  await saveToDb(realMessageId, fromPhone, toPhone, msgType, 'sent', extraFields);
+  console.log(`   [4] MongoDB write done`);
 
-  // Step 3: Upsert contact
+  // 3. Upsert contact
   await upsertContact(toPhone);
-  console.log(`   [5] Contact upserted`);
+  console.log(`   [5] Contact done`);
+  console.log(`${'═'.repeat(60)}\n`);
 
   return { metaRes, realMessageId };
 }
 
-// ─── Store media and update DB record ────────────────────────────────────────
+// ─── Store outbound media in MinIO/local and update DB ────────────────────────
 async function storeMediaAndUpdate(messageId, opts, mimeType) {
   try {
     let stored = {};
@@ -111,17 +123,20 @@ async function storeMediaAndUpdate(messageId, opts, mimeType) {
     }
 
     if (stored.minioUrl || stored.localPath) {
-      const update = {};
+      const db         = mongoose.connection.db;
+      const collection = db.collection('messages');
+      const update     = {};
       if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
       if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
       if (stored.localPath)    update['media.localPath']    = stored.localPath;
       if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
       if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
-      await Message.collection.updateOne({ messageId }, { $set: update });
+      await collection.updateOne({ messageId }, { $set: update });
       console.log(`   ✅ Media stored: ${stored.minioUrl || stored.localPath}`);
     }
   } catch (err) {
     console.error(`   ❌ Media store FAILED for ${messageId}: ${err.message}`);
+    console.error(`      ${err.stack}`);
   }
 }
 
@@ -239,7 +254,11 @@ export async function sendTemplate(to, templateName, languageCode = 'en_US', com
 }
 
 export async function sendButtons(to, bodyText, buttons, headerText = '', footerText = '') {
-  const interactive = { type: 'button', body: { text: bodyText }, action: { buttons: buttons.map(b => ({ type: 'reply', reply: { id: b.id, title: b.title } })) } };
+  const interactive = {
+    type:   'button',
+    body:   { text: bodyText },
+    action: { buttons: buttons.map(b => ({ type: 'reply', reply: { id: b.id, title: b.title } })) },
+  };
   if (headerText) interactive.header = { type: 'text', text: headerText };
   if (footerText) interactive.footer = { text: footerText };
   const { metaRes } = await sendAndSave(
@@ -261,8 +280,16 @@ export async function sendList(to, bodyText, buttonLabel, sections) {
 
 export async function markRead(messageId) {
   try {
-    await axios.post(`${BASE_URL()}/messages`, { messaging_product: 'whatsapp', status: 'read', message_id: messageId }, { headers: { ...authHeader(), 'Content-Type': 'application/json' } });
-    await Message.collection.updateOne({ messageId }, { $set: { status: 'read', updatedAt: new Date() } });
+    await axios.post(
+      `${BASE_URL()}/messages`,
+      { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
+      { headers: { ...authHeader(), 'Content-Type': 'application/json' } }
+    );
+    const db = mongoose.connection.db;
+    await db.collection('messages').updateOne(
+      { messageId },
+      { $set: { status: 'read', updatedAt: new Date() } }
+    );
   } catch (err) {
     console.error(`⚠️  markRead(${messageId}): ${err.message}`);
   }
