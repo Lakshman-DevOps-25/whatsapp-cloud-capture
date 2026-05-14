@@ -198,12 +198,24 @@ router.get('/:id', async (req, res) => {
 
 // POST /api/send/text
 router.post('/send/text', async (req, res) => {
+  // THIS LOG PROVES THE REQUEST REACHED YOUR APP
+  console.log('\n🔴🔴🔴 /api/send/text HIT 🔴🔴🔴');
+  console.log('body:', JSON.stringify(req.body));
   console.log(`\n${'='.repeat(50)}`);
   console.log(`[POST /send/text] body:`, JSON.stringify(req.body));
   console.log(`[POST /send/text] mongoose readyState=${mongoose.connection.readyState}`);
   console.log(`[POST /send/text] db=${mongoose.connection.db?.databaseName}`);
   try {
-    const { to, text } = req.body;
+    const { to } = req.body;
+
+    // Accept both formats:
+    //   { "to": "919...", "text": "Hello" }
+    //   { "to": "919...", "text": { "body": "Hello" } }  ← WhatsApp API format
+    const rawText = req.body.text;
+    const text    = typeof rawText === 'object' && rawText?.body
+                    ? rawText.body          // extract from { body: "..." }
+                    : rawText;              // use as plain string
+
     if (!to)   return res.status(400).json({ error: 'to is required' });
     if (!text) return res.status(400).json({ error: 'text is required' });
 

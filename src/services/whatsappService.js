@@ -23,6 +23,14 @@ const authHeader = () => ({ Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN
 
 // ─── POST to Meta API ─────────────────────────────────────────────────────────
 async function postMessage(payload) {
+
+  console.log(`   📡 Sending to Meta API: ${JSON.stringify(payload)}`);
+
+  console.log(`   📡 POST ${BASE_URL()}/messages`, payload, {
+    headers: { ...authHeader(), 'Content-Type': 'application/json' },
+    timeout: 15000,
+  });
+
   const { data } = await axios.post(`${BASE_URL()}/messages`, payload, {
     headers: { ...authHeader(), 'Content-Type': 'application/json' },
     timeout: 15000,
@@ -103,6 +111,7 @@ async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
   if (!toPhone) throw new Error(`"to" is required`);
 
   // 1. Send to Meta
+  console.log(`metaPayload`, metaPayload);
   const metaRes       = await postMessage(metaPayload);
   const realMessageId = metaRes?.messages?.[0]?.id;
   if (!realMessageId) throw new Error(`Meta returned no messageId: ${JSON.stringify(metaRes)}`);
