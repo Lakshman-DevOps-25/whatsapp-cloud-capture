@@ -114,7 +114,7 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
     };
 
     await collection.updateOne(
-      { messageId: doc.messageId },
+      { messageId },
       { $set: rawDoc },
       { upsert: true }
     );
