@@ -68,6 +68,8 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   console.log(`\n${'─'.repeat(50)}`);
   console.log(`📤 ${type.toUpperCase()} | from=${fromPhone || '(WA_BUSINESS_PHONE not set)'} | to=${toPhone}`);
 
+  console.log(`Type: ${type}`, type);
+
   // Step 1: Send to Meta
   const metaRes       = await postMessage(metaPayload);
   const realMessageId = metaRes?.messages?.[0]?.id;
