@@ -51,7 +51,7 @@ router.get('/', async (req, res) => {
     const page   = Math.max(parseInt(req.query.page  || '1'), 1);
     const limit  = Math.min(parseInt(req.query.limit || '50'), 200);
     const filter = {};
-    if (req.query.type)      filter.type      = req.query.type;
+    if (req.query.type)      filter.type = req.query.type;
     if (req.query.direction) filter.direction = req.query.direction;
     if (req.query.status)    filter.status    = req.query.status;
     const [messages, total] = await Promise.all([
@@ -68,7 +68,7 @@ router.get('/outbound', async (req, res) => {
     const page  = Math.max(parseInt(req.query.page  || '1'), 1);
     const limit = Math.min(parseInt(req.query.limit || '50'), 200);
     const filter = { direction: 'outbound' };
-    if (req.query.type)   filter.type   = req.query.type;
+    if (req.query.type)   filter.type = req.query.type;
     if (req.query.status) filter.status = req.query.status;
     if (req.query.to)     filter.to     = req.query.to;
     const [messages, total] = await Promise.all([
@@ -83,7 +83,7 @@ router.get('/outbound', async (req, res) => {
 router.get('/media', async (req, res) => {
   try {
     const filter = { 'media.mediaId': { $exists: true } };
-    if (req.query.type)      filter.type      = req.query.type;
+    if (req.query.type)      filter.type = req.query.type;
     if (req.query.direction) filter.direction = req.query.direction;
     const messages = await Message.find(filter).sort({ waTimestamp: -1 }).limit(100).lean();
     res.json({ count: messages.length, messages });
@@ -105,20 +105,87 @@ router.get('/contact/:phone', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/messages/:id
-router.get('/:id', async (req, res) => {
-  try {
-    const message = await Message.findOne({ messageId: req.params.id }).lean();
-    if (!message) return res.status(404).json({ error: 'Message not found' });
-    res.json(message);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+// /:id route moved to bottom — see end of READ section
 
 // GET /api/contacts/list
 router.get('/contacts/list', async (req, res) => {
   try {
     const contacts = await Contact.find().sort({ lastSeen: -1 }).lean();
     res.json({ count: contacts.length, contacts });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/messages/:id
+
+// GET /api/test-db — comprehensive DB + env diagnostic
+router.get('/test-db', async (req, res) => {
+  const results = {
+    env: {
+      WA_PHONE_NUMBER_ID: process.env.WA_PHONE_NUMBER_ID || 'NOT SET',
+      WA_BUSINESS_PHONE:  process.env.WA_BUSINESS_PHONE  || 'NOT SET ← ADD THIS TO RAILWAY',
+      WA_API_VERSION:     process.env.WA_API_VERSION      || 'NOT SET',
+      MONGODB_URI:        process.env.MONGODB_URI          ? 'SET' : 'NOT SET',
+      MEDIA_STORAGE:      process.env.MEDIA_STORAGE        || 'NOT SET',
+      MINIO_BUCKET:       process.env.MINIO_BUCKET         || 'NOT SET',
+      MINIO_INTERNAL_URL: process.env.MINIO_INTERNAL_URL   || 'NOT SET',
+      MINIO_PUBLIC_URL:   process.env.MINIO_PUBLIC_URL     || 'NOT SET',
+    },
+    mongooseState:    null,
+    mongooseWrite:    null,   // test via Mongoose model
+    rawCollWrite:     null,   // test via Message.collection (raw driver)
+    typeFieldCheck:   null,   // verify 'type' field saves correctly
+    error:            null,
+  };
+
+  try {
+    const mongoose = (await import('mongoose')).default;
+    results.mongooseState = `readyState=${mongoose.connection.readyState} (1=connected)`;
+
+    const testId = `test_${Date.now()}`;
+    const from   = process.env.WA_BUSINESS_PHONE || 'test_business';
+
+    // Test 1: Mongoose model write
+    try {
+      const w = await Message.findOneAndUpdate(
+        { messageId: testId + '_mongoose' },
+        { $set: { messageId: testId + '_mongoose', direction: 'outbound', from, to: 'test_customer', type: 'text', body: 'mongoose test', waTimestamp: new Date(), status: 'sent' } },
+        { upsert: true, new: true }
+      );
+      results.mongooseWrite = `OK _id=${w._id} type=${w.type}`;
+      await Message.deleteOne({ messageId: testId + '_mongoose' });
+    } catch (e) {
+      results.mongooseWrite = `FAILED: ${e.message}`;
+    }
+
+    // Test 2: Raw collection write (what sendToDb uses)
+    try {
+      const col = Message.collection;
+      const r = await col.updateOne(
+        { messageId: testId + '_raw' },
+        { $set: { messageId: testId + '_raw', direction: 'outbound', from, to: 'test_customer', type: 'text', body: 'raw test', waTimestamp: new Date(), status: 'sent', createdAt: new Date(), updatedAt: new Date() } },
+        { upsert: true }
+      );
+      results.rawCollWrite = `OK matched=${r.matchedCount} upserted=${r.upsertedCount}`;
+
+      // Read it back to verify type field
+      const readBack = await col.findOne({ messageId: testId + '_raw' });
+      results.typeFieldCheck = readBack ? `type=${readBack.type} direction=${readBack.direction} from=${readBack.from}` : 'NOT FOUND';
+      await col.deleteOne({ messageId: testId + '_raw' });
+    } catch (e) {
+      results.rawCollWrite = `FAILED: ${e.message}`;
+    }
+
+  } catch (err) {
+    results.error = err.message;
+  }
+  res.json(results);
+});
+
+router.get('/:id', async (req, res) => {
+  try {
+    const message = await Message.findOne({ messageId: req.params.id }).lean();
+    if (!message) return res.status(404).json({ error: 'Message not found' });
+    res.json(message);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -329,39 +396,5 @@ router.post('/upload', upload.single('media'), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/test-db — verify env vars and DB write
-router.get('/test-db', async (req, res) => {
-  const results = {
-    env: {
-      WA_PHONE_NUMBER_ID: process.env.WA_PHONE_NUMBER_ID || 'NOT SET',
-      WA_BUSINESS_PHONE:  process.env.WA_BUSINESS_PHONE  || 'NOT SET',
-      WA_API_VERSION:     process.env.WA_API_VERSION      || 'NOT SET',
-      MONGODB_URI:        process.env.MONGODB_URI          ? 'SET' : 'NOT SET',
-      MEDIA_STORAGE:      process.env.MEDIA_STORAGE        || 'NOT SET',
-      MINIO_BUCKET:       process.env.MINIO_BUCKET         || 'NOT SET',
-      MINIO_INTERNAL_URL: process.env.MINIO_INTERNAL_URL   || 'NOT SET',
-      MINIO_PUBLIC_URL:   process.env.MINIO_PUBLIC_URL     || 'NOT SET',
-      TEMP_DIR,
-    },
-    dbWrite: null,
-    dbRead:  null,
-    error:   null,
-  };
-  try {
-    const testId  = `test_${Date.now()}`;
-    const written = await Message.findOneAndUpdate(
-      { messageId: testId },
-      { $set: { messageId: testId, direction: 'outbound', from: process.env.WA_BUSINESS_PHONE || 'test', to: 'test_customer', type: 'text', body: 'DB write test', waTimestamp: new Date(), status: 'sent' } },
-      { upsert: true, new: true }
-    );
-    results.dbWrite = `SUCCESS _id=${written._id}`;
-    const read = await Message.findOne({ messageId: testId });
-    results.dbRead  = read ? `SUCCESS direction=${read.direction} from=${read.from} to=${read.to}` : 'NOT FOUND';
-    await Message.deleteOne({ messageId: testId });
-  } catch (err) {
-    results.error = err.message;
-  }
-  res.json(results);
-});
 
 export default router;
