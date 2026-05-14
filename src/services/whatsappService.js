@@ -93,6 +93,15 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
   try {
+    // ✅ Using Mongoose constructor — bypasses the $set path entirely
+    const msg = new Message(doc);  // Mongoose correctly maps doc.type → schema field
+    await msg.save();              // direct insert, type='text' saved correctly
+    console.log(`   ✅ Doc object is saved in DB: _id=${saved._id} | from=${saved.from} | to=${saved.to}`);
+  } catch (dbErr) {
+    console.error(`   ❌ DB save FAILED with error: ${dbErr.message}`);
+  }
+  
+  try {
     const saved = await Message.findOneAndUpdate(
       { messageId: realMessageId },
       { $set: doc },
