@@ -86,12 +86,15 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
     type,
     waTimestamp: new Date(),
     status:      'sent',
+    text: `Sample Text Message 1`,
   };
   if (extraFields.body)       doc.body       = extraFields.body;
   if (extraFields.media)      doc.media      = extraFields.media;
   if (extraFields.location)   doc.location   = extraFields.location;
   if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
+  doc.body = 'Sample Message Body';
+  
   try {
     const saved = await Message.findOneAndUpdate(
       { messageId: realMessageId },
