@@ -217,7 +217,7 @@ router.post('/send/text', async (req, res) => {
                     : rawText;              // use as plain string
 
     if (!to)   return res.status(400).json({ error: 'to is required' });
-    if (!text) return res.status(400).json({ error: 'text is required' });
+    // if (!text) return res.status(400).json({ error: 'text is required' });
 
     // Direct DB write test BEFORE calling sendText
     try {
