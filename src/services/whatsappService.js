@@ -1,19 +1,34 @@
 /**
  * whatsappService.js — OUTBOUND: business → customer
- * Uses raw MongoDB driver (Message.collection) to avoid Mongoose 'type' field quirk.
+ *
+ * Flow for every send:
+ *   1. sendAndSave() → POST to Meta → save to MongoDB
+ *   2. After DB save, store media copy to MinIO/local (async, non-blocking)
+ *      and update the DB record with minioUrl
  */
 
 import axios    from 'axios';
 import fs       from 'fs';
 import path     from 'path';
 import FormData from 'form-data';
-import mongoose from 'mongoose';
 import Message  from '../models/Message.js';
 import Contact  from '../models/Contact.js';
 import { mediaTypeFolder, downloadUrlAndStore, storeLocalFile } from './mediaService.js';
 
 const BASE_URL   = () => `https://graph.facebook.com/${process.env.WA_API_VERSION}/${process.env.WA_PHONE_NUMBER_ID}`;
-const MY_PHONE   = () => (process.env.WA_BUSINESS_PHONE || '').trim();
+
+// MY_PHONE must be the real phone number (e.g. 919000000000)
+// Set WA_BUSINESS_PHONE in Railway env vars
+// If WA_BUSINESS_PHONE is missing, log a warning — do NOT fallback to phone number ID
+const MY_PHONE = () => {
+  const phone = (process.env.WA_BUSINESS_PHONE || '').trim();
+  if (!phone) {
+    console.warn(`⚠️  WA_BUSINESS_PHONE env var is not set! "from" field will be empty in DB.`);
+    console.warn(`   Set WA_BUSINESS_PHONE=919000000000 in Railway environment variables.`);
+  }
+  return phone;
+};
+
 const authHeader = () => ({ Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}` });
 
 // ─── POST to Meta ─────────────────────────────────────────────────────────────
@@ -43,77 +58,61 @@ async function upsertContact(phone) {
   }
 }
 
-// ─── Save outbound message using Mongoose model directly ─────────────────────
-// We use Message.collection.name to get the correct collection name,
-// then use the native driver via mongoose.connection.collection()
-async function saveToDb(messageId, fromPhone, toPhone, msgType, msgStatus, extraFields) {
-  const now = new Date();
+// ─── Core: send to Meta + save to MongoDB ────────────────────────────────────
+async function sendAndSave(to, type, metaPayload, extraFields = {}) {
+  const toPhone   = (to || '').toString().trim();
+  const fromPhone = MY_PHONE();
 
-  console.log(`   💾 DB write start: messageId=${messageId} type=${msgType} from=${fromPhone} to=${toPhone}`);
-  console.log(`   💾 mongoose.connection.readyState=${mongoose.connection.readyState}`);
+  if (!toPhone) throw new Error(`"to" phone number is required`);
 
-  // Use Message model's underlying collection — guaranteed correct name + connection
-  const col = Message.collection;
+  console.log(`\n${'─'.repeat(50)}`);
+  console.log(`📤 ${type.toUpperCase()} | from=${fromPhone || '(WA_BUSINESS_PHONE not set)'} | to=${toPhone}`);
 
+  console.log(`Type: ${type}`, type);
+
+  // Step 1: Send to Meta
+  const metaRes       = await postMessage(metaPayload);
+  const realMessageId = metaRes?.messages?.[0]?.id;
+  if (!realMessageId) throw new Error(`Meta returned no messageId: ${JSON.stringify(metaRes)}`);
+  console.log(`   🆔 messageId: ${realMessageId}`);
+
+  // Step 2: Save to MongoDB
+  // Use upsert — handles race where status webhook already created a placeholder
   const doc = {
-    messageId,
+    messageId:   realMessageId,
     direction:   'outbound',
     from:        fromPhone,
     to:          toPhone,
-    type:        msgType,
-    status:      msgStatus,
-    waTimestamp: now,
-    createdAt:   now,
-    updatedAt:   now,
+    type,
+    waTimestamp: new Date(),
+    status:      'sent',
   };
-
   if (extraFields.body)       doc.body       = extraFields.body;
   if (extraFields.media)      doc.media      = extraFields.media;
   if (extraFields.location)   doc.location   = extraFields.location;
   if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
-  const result = await col.updateOne(
-    { messageId },
-    { $set: doc },
-    { upsert: true }
-  );
+  try {
+    const saved = await Message.findOneAndUpdate(
+      { messageId: realMessageId },
+      { $set: doc },
+      { upsert: true, new: true }
+    );
+    console.log(`   ✅ DB saved: _id=${saved._id} | from=${saved.from} | to=${saved.to}`);
+  } catch (dbErr) {
+    console.error(`   ❌ DB save FAILED: ${dbErr.message}`);
+  }
 
-  console.log(`   ✅ DB write OK: matched=${result.matchedCount} upserted=${result.upsertedCount} type=${msgType}`);
-}
-
-// ─── Core: send to Meta + save to MongoDB ────────────────────────────────────
-async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
-  const toPhone   = (to || '').toString().trim();
-  const fromPhone = MY_PHONE();
-
-  console.log(`\n${'═'.repeat(60)}`);
-  console.log(`📤 SEND ${msgType.toUpperCase()} | to=${toPhone} | from=${fromPhone || 'NOT SET'}`);
-
-  if (!toPhone)   throw new Error(`"to" is required`);
-  if (!fromPhone) console.warn(`   ⚠️  WA_BUSINESS_PHONE env var not set! Set it in Railway.`);
-
-  // 1. Send to Meta
-  console.log(`   [1] Posting to Meta API...`);
-  const metaRes       = await postMessage(metaPayload);
-  const realMessageId = metaRes?.messages?.[0]?.id;
-  if (!realMessageId) throw new Error(`Meta no messageId: ${JSON.stringify(metaRes)}`);
-  console.log(`   [2] messageId=${realMessageId}`);
-
-  // 2. Save to MongoDB
-  console.log(`   [3] Writing to MongoDB...`);
-  await saveToDb(realMessageId, fromPhone, toPhone, msgType, 'sent', extraFields);
-  console.log(`   [4] MongoDB write done`);
-
-  // 3. Upsert contact
+  // Step 3: Upsert contact
   await upsertContact(toPhone);
-  console.log(`   [5] Contact done`);
-  console.log(`${'═'.repeat(60)}\n`);
 
   return { metaRes, realMessageId };
 }
 
-// ─── Store outbound media in MinIO/local and update DB ────────────────────────
+// ─── Store media to MinIO and update DB record ────────────────────────────────
+// Runs AFTER message is saved — never blocks the send flow
 async function storeMediaAndUpdate(messageId, opts, mimeType) {
+  console.log(`   📦 Storing media for messageId=${messageId}...`);
   try {
     let stored = {};
     if (opts.filePath) {
@@ -124,14 +123,15 @@ async function storeMediaAndUpdate(messageId, opts, mimeType) {
     }
 
     if (stored.minioUrl || stored.localPath) {
-      const update     = {};
+      const update = {};
       if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
       if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
       if (stored.localPath)    update['media.localPath']    = stored.localPath;
       if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
       if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
-      await Message.collection.updateOne({ messageId }, { $set: update });
-      console.log(`   ✅ Media stored: ${stored.minioUrl || stored.localPath}`);
+
+      await Message.findOneAndUpdate({ messageId }, { $set: update });
+      console.log(`   ✅ Media stored + DB updated: ${stored.minioUrl || stored.localPath}`);
     }
   } catch (err) {
     console.error(`   ❌ Media store FAILED for ${messageId}: ${err.message}`);
@@ -139,13 +139,17 @@ async function storeMediaAndUpdate(messageId, opts, mimeType) {
   }
 }
 
-// ─── Upload file to WhatsApp CDN ──────────────────────────────────────────────
+// ─── Upload to WhatsApp CDN ───────────────────────────────────────────────────
 export async function uploadMedia(filePath, mimeType) {
   const form = new FormData();
   form.append('messaging_product', 'whatsapp');
-  form.append('file', fs.createReadStream(filePath), { contentType: mimeType, filename: path.basename(filePath) });
+  form.append('file', fs.createReadStream(filePath), {
+    contentType: mimeType,
+    filename:    path.basename(filePath),
+  });
   const { data } = await axios.post(`${BASE_URL()}/media`, form, {
-    headers: { ...authHeader(), ...form.getHeaders() }, timeout: 30000,
+    headers: { ...authHeader(), ...form.getHeaders() },
+    timeout: 30000,
   });
   console.log(`   ☁️  WA CDN mediaId: ${data.id}`);
   return data.id;
@@ -153,6 +157,10 @@ export async function uploadMedia(filePath, mimeType) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SEND FUNCTIONS
+// Each function:
+//   1. Uploads file to WA CDN (if filePath provided)
+//   2. Calls sendAndSave → Meta API + MongoDB
+//   3. After save, stores media copy to MinIO/local (non-blocking)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendText(to, text, previewUrl = false) {
@@ -165,17 +173,23 @@ export async function sendText(to, text, previewUrl = false) {
 }
 
 export async function sendImage(to, { url, mediaId, caption = '', filePath, mimeType = 'image/jpeg' }) {
+  // Upload to WA CDN if file provided
   let resolvedId = mediaId;
   if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
   if (!resolvedId && !url) throw new Error('sendImage: provide url, mediaId, or filePath');
+
   const imageObj = resolvedId ? { id: resolvedId } : { link: url };
   if (caption) imageObj.caption = caption;
+
   const { metaRes, realMessageId } = await sendAndSave(
     to, 'image',
     { messaging_product: 'whatsapp', to, type: 'image', image: imageObj },
     { body: caption, media: { mediaId: resolvedId, mimeType, caption } }
   );
+
+  // Store media copy AFTER DB save (non-blocking)
   storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
+
   return metaRes;
 }
 
@@ -183,13 +197,16 @@ export async function sendVideo(to, { url, mediaId, caption = '', filePath, mime
   let resolvedId = mediaId;
   if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
   if (!resolvedId && !url) throw new Error('sendVideo: provide url, mediaId, or filePath');
+
   const videoObj = resolvedId ? { id: resolvedId } : { link: url };
   if (caption) videoObj.caption = caption;
+
   const { metaRes, realMessageId } = await sendAndSave(
     to, 'video',
     { messaging_product: 'whatsapp', to, type: 'video', video: videoObj },
     { body: caption, media: { mediaId: resolvedId, mimeType, caption } }
   );
+
   storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
   return metaRes;
 }
@@ -198,28 +215,38 @@ export async function sendAudio(to, { url, mediaId, filePath, mimeType = 'audio/
   let resolvedId = mediaId;
   if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
   if (!resolvedId && !url) throw new Error('sendAudio: provide url, mediaId, or filePath');
+
   const audioObj = resolvedId ? { id: resolvedId } : { link: url };
+
   const { metaRes, realMessageId } = await sendAndSave(
     to, 'audio',
     { messaging_product: 'whatsapp', to, type: 'audio', audio: audioObj },
     { media: { mediaId: resolvedId, mimeType } }
   );
+
   storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
   return metaRes;
 }
 
 export async function sendDocument(to, { url, mediaId, caption = '', fileName = '', filePath, mimeType = 'application/octet-stream' }) {
-  let resolvedId = mediaId, resolvedName = fileName;
-  if (filePath) { resolvedId = await uploadMedia(filePath, mimeType); resolvedName = resolvedName || path.basename(filePath); }
+  let resolvedId   = mediaId;
+  let resolvedName = fileName;
+  if (filePath) {
+    resolvedId   = await uploadMedia(filePath, mimeType);
+    resolvedName = resolvedName || path.basename(filePath);
+  }
   if (!resolvedId && !url) throw new Error('sendDocument: provide url, mediaId, or filePath');
+
   const docObj = resolvedId ? { id: resolvedId } : { link: url };
   if (caption)      docObj.caption  = caption;
   if (resolvedName) docObj.filename = resolvedName;
+
   const { metaRes, realMessageId } = await sendAndSave(
     to, 'document',
     { messaging_product: 'whatsapp', to, type: 'document', document: docObj },
     { body: caption, media: { mediaId: resolvedId, mimeType, fileName: resolvedName, caption } }
   );
+
   storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
   return metaRes;
 }
@@ -260,6 +287,7 @@ export async function sendButtons(to, bodyText, buttons, headerText = '', footer
   };
   if (headerText) interactive.header = { type: 'text', text: headerText };
   if (footerText) interactive.footer = { text: footerText };
+
   const { metaRes } = await sendAndSave(
     to, 'interactive',
     { messaging_product: 'whatsapp', to, type: 'interactive', interactive },
@@ -284,10 +312,7 @@ export async function markRead(messageId) {
       { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
       { headers: { ...authHeader(), 'Content-Type': 'application/json' } }
     );
-    await Message.collection.updateOne(
-      { messageId },
-      { $set: { status: 'read', updatedAt: new Date() } }
-    );
+    await Message.findOneAndUpdate({ messageId }, { $set: { status: 'read' } });
   } catch (err) {
     console.error(`⚠️  markRead(${messageId}): ${err.message}`);
   }

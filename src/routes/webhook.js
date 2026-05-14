@@ -23,10 +23,9 @@
  * BEFORE the message is sent to Meta. Webhook only updates their status.
  */
 
-import express  from 'express';
-import mongoose from 'mongoose';
-import Message  from '../models/Message.js';
-import Contact  from '../models/Contact.js';
+import express from 'express';
+import Message from '../models/Message.js';
+import Contact from '../models/Contact.js';
 import { downloadAndStoreMedia } from '../services/mediaService.js';
 
 const router = express.Router();
@@ -197,17 +196,14 @@ async function handleInbound(msg, value) {
       doc.body = `[unsupported: ${msg.type}]`;
   }
 
-  // ── Save to MongoDB via native driver ────────────────────────────────────
-  console.log(`   💾 Saving: messageId=${msg.id} type=${doc.type} direction=inbound`);
+  // ── Save to MongoDB ───────────────────────────────────────────────────────
   try {
-    const now = new Date();
-    const col = mongoose.connection.db.collection('messages');
-    await col.updateOne(
+    const saved = await Message.findOneAndUpdate(
       { messageId: msg.id },
-      { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
-      { upsert: true }
+      { $set: doc },
+      { upsert: true, new: true }
     );
-    console.log(`   ✅ DB saved inbound: type=${doc.type} from=${doc.from} to=${doc.to}`);
+    console.log(`   ✅ DB saved inbound [${msg.id}] _id=${saved._id}`);
   } catch (err) {
     console.error(`   ❌ DB save failed (${msg.id}):`, err.message);
     return;
@@ -232,8 +228,7 @@ async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
     if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
 
     if (Object.keys(update).length > 0) {
-      const col = mongoose.connection.db.collection('messages');
-      await col.updateOne({ messageId }, { $set: update });
+      await Message.findOneAndUpdate({ messageId }, { $set: update });
       console.log(`   ✅ Inbound media stored and DB updated: ${stored.minioUrl || stored.localPath}`);
     }
   } catch (err) {
@@ -244,32 +239,46 @@ async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STATUS UPDATE: delivery receipt for outbound message
-// Only updates existing records — never creates placeholders.
-// sendAndSave() is the sole writer of outbound records.
+//
+// Meta fires status=sent almost instantly after the API call — sometimes
+// before Message.create() finishes. So we UPSERT:
+//   - record exists  → update status field
+//   - record missing → create a placeholder (direction=outbound, type=unknown)
+//     sendAndSave() will later update the same messageId with full details,
+//     or this placeholder becomes the permanent record.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleStatus(status) {
   try {
-    const update = { status: status.status };
+    const myPhone        = (process.env.WA_BUSINESS_PHONE || '').trim();
+    const recipientPhone = status.recipient_id || '';
+
+    const setFields = {
+      status:      status.status,
+      direction:   'outbound',
+      from:        myPhone,
+      to:          recipientPhone,
+      waTimestamp: status.timestamp ? new Date(parseInt(status.timestamp) * 1000) : new Date(),
+    };
 
     if (status.errors?.[0]) {
-      update.errorCode    = status.errors[0].code?.toString();
-      update.errorMessage = status.errors[0].title;
+      setFields.errorCode    = status.errors[0].code?.toString();
+      setFields.errorMessage = status.errors[0].title;
     }
 
-    // Only update — never create a placeholder.
-    // sendAndSave() is the only writer of outbound records.
-    // status=sent may arrive before sendAndSave writes — that's OK, just skip it.
-    // status=delivered and status=read always arrive after sendAndSave, so they update correctly.
-    const col    = mongoose.connection.db.collection('messages');
-    const result = await col.updateOne(
+    const result = await Message.findOneAndUpdate(
       { messageId: status.id },
-      { $set: { ...update, updatedAt: new Date() } }
+      {
+        $set:         setFields,
+        $setOnInsert: { messageId: status.id, type: 'unknown' },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    if (result.matchedCount > 0) {
-      console.log(`📬 STATUS [${status.id}] → ${status.status}`);
+    const isPlaceholder = result.type === 'unknown';
+    if (isPlaceholder) {
+      console.log(`📬 STATUS [${status.id}] → ${status.status} (placeholder created)`);
     } else {
-      console.log(`📬 STATUS [${status.id}] → ${status.status} (no record yet — sendAndSave will write it)`);
+      console.log(`📬 STATUS [${status.id}] → ${status.status} from=${result.from} to=${result.to}`);
     }
   } catch (err) {
     console.error(`⚠️  Status update(${status.id}): ${err.message}`);
