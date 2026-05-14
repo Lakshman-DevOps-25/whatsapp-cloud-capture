@@ -51,7 +51,7 @@ router.get('/', async (req, res) => {
     const page   = Math.max(parseInt(req.query.page  || '1'), 1);
     const limit  = Math.min(parseInt(req.query.limit || '50'), 200);
     const filter = {};
-    if (req.query.type)      filter.type      = req.query.type;
+    if (req.query.type)      filter.type = req.query.type;
     if (req.query.direction) filter.direction = req.query.direction;
     if (req.query.status)    filter.status    = req.query.status;
     const [messages, total] = await Promise.all([
@@ -68,7 +68,7 @@ router.get('/outbound', async (req, res) => {
     const page  = Math.max(parseInt(req.query.page  || '1'), 1);
     const limit = Math.min(parseInt(req.query.limit || '50'), 200);
     const filter = { direction: 'outbound' };
-    if (req.query.type)   filter.type   = req.query.type;
+    if (req.query.type)   filter.type = req.query.type;
     if (req.query.status) filter.status = req.query.status;
     if (req.query.to)     filter.to     = req.query.to;
     const [messages, total] = await Promise.all([
@@ -83,7 +83,7 @@ router.get('/outbound', async (req, res) => {
 router.get('/media', async (req, res) => {
   try {
     const filter = { 'media.mediaId': { $exists: true } };
-    if (req.query.type)      filter.type      = req.query.type;
+    if (req.query.type)      filter.type = req.query.type;
     if (req.query.direction) filter.direction = req.query.direction;
     const messages = await Message.find(filter).sort({ waTimestamp: -1 }).limit(100).lean();
     res.json({ count: messages.length, messages });

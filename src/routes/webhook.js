@@ -196,14 +196,16 @@ async function handleInbound(msg, value) {
       doc.body = `[unsupported: ${msg.type}]`;
   }
 
-  // ── Save to MongoDB ───────────────────────────────────────────────────────
+  // ── Save to MongoDB via raw driver — bypasses Mongoose 'type' keyword quirk ──
+  console.log(`   💾 Saving to DB: messageId=${msg.id} type=${doc.type} direction=${doc.direction}`);
   try {
-    const saved = await Message.findOneAndUpdate(
+    const now = new Date();
+    await Message.collection.updateOne(
       { messageId: msg.id },
-      { $set: doc },
-      { upsert: true, new: true }
+      { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
+      { upsert: true }
     );
-    console.log(`   ✅ DB saved inbound [${msg.id}] _id=${saved._id}`);
+    console.log(`   ✅ DB saved inbound: type=${doc.type} from=${doc.from} to=${doc.to}`);
   } catch (err) {
     console.error(`   ❌ DB save failed (${msg.id}):`, err.message);
     return;
@@ -239,46 +241,34 @@ async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STATUS UPDATE: delivery receipt for outbound message
-//
-// Meta fires status=sent almost instantly after the API call — sometimes
-// before Message.create() finishes. So we UPSERT:
-//   - record exists  → update status field
-//   - record missing → create a placeholder (direction=outbound, type=unknown)
-//     sendAndSave() will later update the same messageId with full details,
-//     or this placeholder becomes the permanent record.
+// Only updates existing records — never creates placeholders.
+// sendAndSave() is the sole writer of outbound records.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleStatus(status) {
   try {
-    const myPhone        = (process.env.WA_BUSINESS_PHONE || '').trim();
-    const recipientPhone = status.recipient_id || '';
-
-    const setFields = {
-      status:      status.status,
-      direction:   'outbound',
-      from:        myPhone,
-      to:          recipientPhone,
-      waTimestamp: status.timestamp ? new Date(parseInt(status.timestamp) * 1000) : new Date(),
-    };
+    const update = { status: status.status };
 
     if (status.errors?.[0]) {
-      setFields.errorCode    = status.errors[0].code?.toString();
-      setFields.errorMessage = status.errors[0].title;
+      update.errorCode    = status.errors[0].code?.toString();
+      update.errorMessage = status.errors[0].title;
     }
 
-    const result = await Message.findOneAndUpdate(
+    // Only update — never create a placeholder.
+    // sendAndSave() is the only writer of outbound records.
+    // status=sent may arrive before sendAndSave writes — that's OK, just skip it.
+    // status=delivered and status=read always arrive after sendAndSave, so they update correctly.
+    const updated = await Message.findOneAndUpdate(
       { messageId: status.id },
-      {
-        $set:         setFields,
-        $setOnInsert: { messageId: status.id, type: 'unknown' },
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { $set: update },
+      { new: true }
     );
 
-    const isPlaceholder = result.type === 'unknown';
-    if (isPlaceholder) {
-      console.log(`📬 STATUS [${status.id}] → ${status.status} (placeholder created)`);
+    if (updated) {
+      console.log(`📬 STATUS [${status.id}] → ${status.status} | type=${updated.type} from=${updated.from} to=${updated.to}`);
     } else {
-      console.log(`📬 STATUS [${status.id}] → ${status.status} from=${result.from} to=${result.to}`);
+      // Record doesn't exist yet (status=sent race) — sendAndSave will write it shortly.
+      // The status will be set to 'sent' by sendAndSave itself, so nothing is lost.
+      console.log(`📬 STATUS [${status.id}] → ${status.status} (record not yet written by sendAndSave — skipping)`);
     }
   } catch (err) {
     console.error(`⚠️  Status update(${status.id}): ${err.message}`);

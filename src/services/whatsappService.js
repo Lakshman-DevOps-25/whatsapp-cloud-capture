@@ -75,7 +75,7 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   console.log(`   🆔 messageId: ${realMessageId}`);
 
   // Step 2: Save to MongoDB
-  // Use upsert — handles race where status webhook already created a placeholder
+  // Build document and save — same pattern as inbound in webhook.js.
   const doc = {
     messageId:   realMessageId,
     direction:   'outbound',
@@ -90,15 +90,36 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   if (extraFields.location)   doc.location   = extraFields.location;
   if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
+  // Use raw MongoDB collection to bypass ALL Mongoose schema quirks with 'type' field.
+  // mongoose.connection.db gives direct access to the native MongoDB driver.
   try {
-    const saved = await Message.findOneAndUpdate(
-      { messageId: realMessageId },
-      { $set: doc },
-      { upsert: true, new: true }
+    const collection = Message.collection;
+    const now = new Date();
+    const rawDoc = {
+      messageId:   doc.messageId,
+      direction:   doc.direction,
+      from:        doc.from,
+      to:          doc.to,
+      type:        doc.type,        // raw driver has no 'type' keyword conflict
+      body:        doc.body        || null,
+      media:       doc.media       || null,
+      location:    doc.location    || null,
+      rawPayload:  doc.rawPayload  || null,
+      waTimestamp: doc.waTimestamp,
+      status:      doc.status,
+      createdAt:   now,
+      updatedAt:   now,
+    };
+
+    await collection.updateOne(
+      { messageId: doc.messageId },
+      { $set: rawDoc },
+      { upsert: true }
     );
-    console.log(`   ✅ DB saved: _id=${saved._id} | from=${saved.from} | to=${saved.to}`);
+    console.log(`   ✅ DB saved: type=${doc.type} from=${doc.from} to=${doc.to} status=${doc.status}`);
   } catch (dbErr) {
     console.error(`   ❌ DB save FAILED: ${dbErr.message}`);
+    console.error(`      Stack: ${dbErr.stack}`);
   }
 
   // Step 3: Upsert contact
