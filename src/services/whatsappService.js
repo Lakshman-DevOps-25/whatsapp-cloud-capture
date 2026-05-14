@@ -43,11 +43,18 @@ async function upsertContact(phone) {
   }
 }
 
-// ─── Direct MongoDB insert/update — bypasses Mongoose schema for 'type' field ─
+// ─── Save outbound message using Mongoose model directly ─────────────────────
+// We use Message.collection.name to get the correct collection name,
+// then use the native driver via mongoose.connection.collection()
 async function saveToDb(messageId, fromPhone, toPhone, msgType, msgStatus, extraFields) {
   const now = new Date();
 
-  // Build raw document with all fields explicitly named
+  console.log(`   💾 DB write start: messageId=${messageId} type=${msgType} from=${fromPhone} to=${toPhone}`);
+  console.log(`   💾 mongoose.connection.readyState=${mongoose.connection.readyState}`);
+
+  // Use Message model's underlying collection — guaranteed correct name + connection
+  const col = Message.collection;
+
   const doc = {
     messageId,
     direction:   'outbound',
@@ -65,19 +72,13 @@ async function saveToDb(messageId, fromPhone, toPhone, msgType, msgStatus, extra
   if (extraFields.location)   doc.location   = extraFields.location;
   if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
-  console.log(`   💾 DB write: messageId=${messageId} type=${msgType} from=${fromPhone} to=${toPhone}`);
-
-  // Use native MongoDB driver directly — zero Mongoose processing
-  const db         = mongoose.connection.db;
-  const collection = db.collection('messages');
-
-  await collection.updateOne(
+  const result = await col.updateOne(
     { messageId },
     { $set: doc },
     { upsert: true }
   );
 
-  console.log(`   ✅ DB write OK: type=${msgType} status=${msgStatus}`);
+  console.log(`   ✅ DB write OK: matched=${result.matchedCount} upserted=${result.upsertedCount} type=${msgType}`);
 }
 
 // ─── Core: send to Meta + save to MongoDB ────────────────────────────────────
@@ -123,15 +124,13 @@ async function storeMediaAndUpdate(messageId, opts, mimeType) {
     }
 
     if (stored.minioUrl || stored.localPath) {
-      const db         = mongoose.connection.db;
-      const collection = db.collection('messages');
       const update     = {};
       if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
       if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
       if (stored.localPath)    update['media.localPath']    = stored.localPath;
       if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
       if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
-      await collection.updateOne({ messageId }, { $set: update });
+      await Message.collection.updateOne({ messageId }, { $set: update });
       console.log(`   ✅ Media stored: ${stored.minioUrl || stored.localPath}`);
     }
   } catch (err) {
@@ -285,8 +284,7 @@ export async function markRead(messageId) {
       { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
       { headers: { ...authHeader(), 'Content-Type': 'application/json' } }
     );
-    const db = mongoose.connection.db;
-    await db.collection('messages').updateOne(
+    await Message.collection.updateOne(
       { messageId },
       { $set: { status: 'read', updatedAt: new Date() } }
     );
