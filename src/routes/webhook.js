@@ -201,8 +201,8 @@ async function handleInbound(msg, value) {
   console.log(`   💾 Saving: messageId=${msg.id} type=${doc.type} direction=inbound`);
   try {
     const now = new Date();
-    const col = mongoose.connection.db.collection('messages');
-    await col.updateOne(
+    const { default: Msg } = await import('../models/Message.js');
+    await Msg.collection.updateOne(
       { messageId: msg.id },
       { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
       { upsert: true }
@@ -232,8 +232,8 @@ async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
     if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
 
     if (Object.keys(update).length > 0) {
-      const col = mongoose.connection.db.collection('messages');
-      await col.updateOne({ messageId }, { $set: update });
+      const { default: Msg } = await import('../models/Message.js');
+      await Msg.collection.updateOne({ messageId }, { $set: update });
       console.log(`   ✅ Inbound media stored and DB updated: ${stored.minioUrl || stored.localPath}`);
     }
   } catch (err) {
@@ -255,8 +255,8 @@ async function handleStatus(status) {
       update.errorMessage = status.errors[0].title;
     }
 
-    const col    = mongoose.connection.db.collection('messages');
-    const result = await col.updateOne(
+    const { default: Msg } = await import('../models/Message.js');
+    const result = await Msg.collection.updateOne(
       { messageId: status.id },
       { $set: { ...update, updatedAt: new Date() } }
     );

@@ -1,19 +1,7 @@
-/**
- * whatsappService.js — OUTBOUND: business → customer
- *
- * Uses the EXACT same MongoDB save pattern as inbound (webhook.js):
- *   mongoose.connection.db.collection('messages').updateOne(
- *     { messageId },
- *     { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
- *     { upsert: true }
- *   )
- */
-
 import axios    from 'axios';
 import fs       from 'fs';
 import path     from 'path';
 import FormData from 'form-data';
-import mongoose from 'mongoose';
 import Contact  from '../models/Contact.js';
 import { mediaTypeFolder, downloadUrlAndStore, storeLocalFile } from './mediaService.js';
 
@@ -21,66 +9,34 @@ const BASE_URL   = () => `https://graph.facebook.com/${process.env.WA_API_VERSIO
 const MY_PHONE   = () => (process.env.WA_BUSINESS_PHONE || '').trim();
 const authHeader = () => ({ Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}` });
 
-// ─── POST to Meta API ─────────────────────────────────────────────────────────
+// ─── POST to Meta ─────────────────────────────────────────────────────────────
 async function postMessage(payload) {
-
-  console.log(`   📡 Sending to Meta API: ${JSON.stringify(payload)}`);
-
-  console.log(`   📡 POST ${BASE_URL()}/messages`, payload, {
-    headers: { ...authHeader(), 'Content-Type': 'application/json' },
-    timeout: 15000,
-  });
-
   const { data } = await axios.post(`${BASE_URL()}/messages`, payload, {
     headers: { ...authHeader(), 'Content-Type': 'application/json' },
     timeout: 15000,
   });
-  console.log(`   📡 Meta response: ${JSON.stringify(data)}`);
+  console.log(`   📡 Meta: ${JSON.stringify(data)}`);
   return data;
 }
 
-// ─── Save to MongoDB — tries Message.collection first, falls back to mongoose.connection.db ──
+// ─── Save to MongoDB ──────────────────────────────────────────────────────────
+// Import Message model inside the function to ensure it's called AFTER
+// mongoose is fully connected (avoids module-load-time connection issues)
 async function saveMessage(doc) {
+  // Dynamic import ensures we get the model AFTER mongoose is connected
+  const { default: Message } = await import('../models/Message.js');
   const now = new Date();
-  const setDoc = { ...doc, updatedAt: now };
-  const filter = { messageId: doc.messageId };
-  const update = { $set: setDoc, $setOnInsert: { createdAt: now } };
-  const opts   = { upsert: true };
 
-  console.log(`   💾 Saving: messageId=${doc.messageId} type=${doc.type} from=${doc.from} to=${doc.to}`);
-  console.log(`   💾 mongoose readyState=${mongoose.connection.readyState} db=${mongoose.connection.db?.databaseName}`);
+  console.log(`   💾 saveMessage: id=${doc.messageId} type=${doc.type} from=${doc.from} to=${doc.to}`);
 
-  let result;
+  const result = await Message.collection.updateOne(
+    { messageId: doc.messageId },
+    { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
+    { upsert: true }
+  );
 
-  // Method 1: Message.collection (Mongoose model collection — used by inbound webhook)
-  try {
-    result = await mongoose.connection.db.collection('messages').updateOne(filter, update, opts);
-    console.log(`   ✅ Saved via mongoose.connection.db: matched=${result.matchedCount} upserted=${result.upsertedCount}`);
-    return result;
-  } catch (err1) {
-    console.error(`   ⚠️  mongoose.connection.db failed: ${err1.message}`);
-  }
-
-  // Method 2: Message.collection (Mongoose model)
-  try {
-    const { default: Message } = await import('../models/Message.js');
-    result = await Message.collection.updateOne(filter, update, opts);
-    console.log(`   ✅ Saved via Message.collection: matched=${result.matchedCount} upserted=${result.upsertedCount}`);
-    return result;
-  } catch (err2) {
-    console.error(`   ⚠️  Message.collection failed: ${err2.message}`);
-  }
-
-  // Method 3: Mongoose findOneAndUpdate (last resort)
-  try {
-    const { default: Message } = await import('../models/Message.js');
-    const saved = await Message.collection.findOneAndUpdate(filter, { $set: setDoc }, { upsert: true, returnDocument: 'after' });
-    console.log(`   ✅ Saved via findOneAndUpdate: _id=${saved?._id}`);
-    return saved;
-  } catch (err3) {
-    console.error(`   ❌ ALL save methods failed: ${err3.message}`);
-    throw err3;
-  }
+  console.log(`   ✅ saveMessage OK: matched=${result.matchedCount} upserted=${result.upsertedCount}`);
+  return result;
 }
 
 // ─── Upsert contact ───────────────────────────────────────────────────────────
@@ -100,24 +56,23 @@ async function upsertContact(phone) {
   }
 }
 
-// ─── Core: send to Meta + save to MongoDB ────────────────────────────────────
+// ─── Core send + save ─────────────────────────────────────────────────────────
 async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
   const toPhone   = (to || '').toString().trim();
   const fromPhone = MY_PHONE();
 
-  console.log(`\n${'═'.repeat(60)}`);
-  console.log(`📤 SEND ${msgType.toUpperCase()} | from=${fromPhone || '(WA_BUSINESS_PHONE NOT SET)'} | to=${toPhone}`);
+  console.log(`\n${'═'.repeat(50)}`);
+  console.log(`📤 ${msgType.toUpperCase()} | from=${fromPhone} | to=${toPhone}`);
 
   if (!toPhone) throw new Error(`"to" is required`);
 
   // 1. Send to Meta
-  console.log(`metaPayload`, metaPayload);
   const metaRes       = await postMessage(metaPayload);
   const realMessageId = metaRes?.messages?.[0]?.id;
-  if (!realMessageId) throw new Error(`Meta returned no messageId: ${JSON.stringify(metaRes)}`);
-  console.log(`   🆔 messageId=${realMessageId}`);
+  if (!realMessageId) throw new Error(`Meta no messageId: ${JSON.stringify(metaRes)}`);
+  console.log(`   🆔 ${realMessageId}`);
 
-  // 2. Build document — same structure as inbound doc in webhook.js
+  // 2. Build doc
   const doc = {
     messageId:   realMessageId,
     direction:   'outbound',
@@ -127,31 +82,22 @@ async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
     status:      'sent',
     waTimestamp: new Date(),
   };
-
   if (extraFields.body)       doc.body       = extraFields.body;
   if (extraFields.media)      doc.media      = extraFields.media;
   if (extraFields.location)   doc.location   = extraFields.location;
   if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
-  // 3. Save to MongoDB
-  console.log(`   [3] Calling saveMessage type=${msgType} to=${toPhone}`);
-  try {
-    await saveMessage(doc);
-    console.log(`   [4] saveMessage OK`);
-  } catch (saveErr) {
-    console.error(`   ❌ saveMessage THREW: ${saveErr.message}`);
-    console.error(`      Stack: ${saveErr.stack}`);
-    throw saveErr;
-  }
+  // 3. Save to DB
+  await saveMessage(doc);
 
   // 4. Upsert contact
   await upsertContact(toPhone);
 
-  console.log(`${'═'.repeat(60)}\n`);
+  console.log(`${'═'.repeat(50)}\n`);
   return { metaRes, realMessageId };
 }
 
-// ─── Store outbound media in MinIO/local then update DB ──────────────────────
+// ─── Store outbound media in MinIO ────────────────────────────────────────────
 async function storeOutboundMedia(messageId, opts, mimeType) {
   try {
     let stored = {};
@@ -161,25 +107,23 @@ async function storeOutboundMedia(messageId, opts, mimeType) {
       const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
       stored = await downloadUrlAndStore(opts.url, mimeType, prefix);
     }
-
     if (stored.minioUrl || stored.localPath) {
+      const { default: Message } = await import('../models/Message.js');
       const update = {};
       if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
       if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
       if (stored.localPath)    update['media.localPath']    = stored.localPath;
       if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
       if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
-
-      const col = mongoose.connection.db.collection('messages');
-      await col.updateOne({ messageId }, { $set: update });
-      console.log(`   ✅ Outbound media stored: ${stored.minioUrl || stored.localPath}`);
+      await Message.collection.updateOne({ messageId }, { $set: update });
+      console.log(`   ✅ Media stored: ${stored.minioUrl || stored.localPath}`);
     }
   } catch (err) {
-    console.error(`   ❌ Outbound media store FAILED (${messageId}): ${err.message}`);
+    console.error(`   ❌ storeOutboundMedia(${messageId}): ${err.message}`);
   }
 }
 
-// ─── Upload file to WhatsApp CDN ──────────────────────────────────────────────
+// ─── Upload to WhatsApp CDN ───────────────────────────────────────────────────
 export async function uploadMedia(filePath, mimeType) {
   const form = new FormData();
   form.append('messaging_product', 'whatsapp');
@@ -198,13 +142,7 @@ export async function uploadMedia(filePath, mimeType) {
 export async function sendText(to, text) {
   const { metaRes } = await sendAndSave(
     to, 'text',
-    {
-      messaging_product: 'whatsapp',
-      recipient_type:    'individual',
-      to,
-      type: 'text',
-      text: { body: text },
-    },
+    { messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { body: text } },
     { body: text }
   );
   return metaRes;
@@ -214,10 +152,8 @@ export async function sendImage(to, { url, mediaId, caption = '', filePath, mime
   let resolvedId = mediaId;
   if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
   if (!resolvedId && !url) throw new Error('sendImage: provide url, mediaId, or filePath');
-
   const imageObj = resolvedId ? { id: resolvedId } : { link: url };
   if (caption) imageObj.caption = caption;
-
   const { metaRes, realMessageId } = await sendAndSave(
     to, 'image',
     { messaging_product: 'whatsapp', to, type: 'image', image: imageObj },
@@ -231,10 +167,8 @@ export async function sendVideo(to, { url, mediaId, caption = '', filePath, mime
   let resolvedId = mediaId;
   if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
   if (!resolvedId && !url) throw new Error('sendVideo: provide url, mediaId, or filePath');
-
   const videoObj = resolvedId ? { id: resolvedId } : { link: url };
   if (caption) videoObj.caption = caption;
-
   const { metaRes, realMessageId } = await sendAndSave(
     to, 'video',
     { messaging_product: 'whatsapp', to, type: 'video', video: videoObj },
@@ -248,9 +182,7 @@ export async function sendAudio(to, { url, mediaId, filePath, mimeType = 'audio/
   let resolvedId = mediaId;
   if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
   if (!resolvedId && !url) throw new Error('sendAudio: provide url, mediaId, or filePath');
-
   const audioObj = resolvedId ? { id: resolvedId } : { link: url };
-
   const { metaRes, realMessageId } = await sendAndSave(
     to, 'audio',
     { messaging_product: 'whatsapp', to, type: 'audio', audio: audioObj },
@@ -262,16 +194,11 @@ export async function sendAudio(to, { url, mediaId, filePath, mimeType = 'audio/
 
 export async function sendDocument(to, { url, mediaId, caption = '', fileName = '', filePath, mimeType = 'application/octet-stream' }) {
   let resolvedId = mediaId, resolvedName = fileName;
-  if (filePath) {
-    resolvedId   = await uploadMedia(filePath, mimeType);
-    resolvedName = resolvedName || path.basename(filePath);
-  }
+  if (filePath) { resolvedId = await uploadMedia(filePath, mimeType); resolvedName = resolvedName || path.basename(filePath); }
   if (!resolvedId && !url) throw new Error('sendDocument: provide url, mediaId, or filePath');
-
   const docObj = resolvedId ? { id: resolvedId } : { link: url };
   if (caption)      docObj.caption  = caption;
   if (resolvedName) docObj.filename = resolvedName;
-
   const { metaRes, realMessageId } = await sendAndSave(
     to, 'document',
     { messaging_product: 'whatsapp', to, type: 'document', document: docObj },
@@ -317,7 +244,6 @@ export async function sendButtons(to, bodyText, buttons, headerText = '', footer
   };
   if (headerText) interactive.header = { type: 'text', text: headerText };
   if (footerText) interactive.footer = { text: footerText };
-
   const { metaRes } = await sendAndSave(
     to, 'interactive',
     { messaging_product: 'whatsapp', to, type: 'interactive', interactive },
@@ -329,10 +255,7 @@ export async function sendButtons(to, bodyText, buttons, headerText = '', footer
 export async function sendList(to, bodyText, buttonLabel, sections) {
   const { metaRes } = await sendAndSave(
     to, 'interactive',
-    {
-      messaging_product: 'whatsapp', to, type: 'interactive',
-      interactive: { type: 'list', body: { text: bodyText }, action: { button: buttonLabel, sections } },
-    },
+    { messaging_product: 'whatsapp', to, type: 'interactive', interactive: { type: 'list', body: { text: bodyText }, action: { button: buttonLabel, sections } } },
     { body: bodyText, rawPayload: { type: 'list', bodyText, buttonLabel, sections } }
   );
   return metaRes;
@@ -345,8 +268,11 @@ export async function markRead(messageId) {
       { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
       { headers: { ...authHeader(), 'Content-Type': 'application/json' } }
     );
-    const col = mongoose.connection.db.collection('messages');
-    await col.updateOne({ messageId }, { $set: { status: 'read', updatedAt: new Date() } });
+    const { default: Message } = await import('../models/Message.js');
+    await Message.collection.updateOne(
+      { messageId },
+      { $set: { status: 'read', updatedAt: new Date() } }
+    );
   } catch (err) {
     console.error(`⚠️  markRead(${messageId}): ${err.message}`);
   }
