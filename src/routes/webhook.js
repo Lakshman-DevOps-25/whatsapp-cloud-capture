@@ -196,13 +196,16 @@ async function handleInbound(msg, value) {
       doc.body = `[unsupported: ${msg.type}]`;
   }
 
-  // ── Save to MongoDB via raw driver — bypasses Mongoose 'type' keyword quirk ──
-  console.log(`   💾 Saving to DB: messageId=${msg.id} type=${doc.type} direction=${doc.direction}`);
+  // ── Save to MongoDB via raw driver ───────────────────────────────────────
+  console.log(`   💾 Saving: messageId=${msg.id} type=${doc.type} direction=inbound`);
   try {
     const now = new Date();
     await Message.collection.updateOne(
       { messageId: msg.id },
-      { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
+      {
+        $set: { ...doc, updatedAt: now },
+        $setOnInsert: { createdAt: now }
+      },
       { upsert: true }
     );
     console.log(`   ✅ DB saved inbound: type=${doc.type} from=${doc.from} to=${doc.to}`);
@@ -257,18 +260,15 @@ async function handleStatus(status) {
     // sendAndSave() is the only writer of outbound records.
     // status=sent may arrive before sendAndSave writes — that's OK, just skip it.
     // status=delivered and status=read always arrive after sendAndSave, so they update correctly.
-    const updated = await Message.findOneAndUpdate(
+    const result = await Message.collection.updateOne(
       { messageId: status.id },
-      { $set: update },
-      { new: true }
+      { $set: { ...update, updatedAt: new Date() } }
     );
 
-    if (updated) {
-      console.log(`📬 STATUS [${status.id}] → ${status.status} | type=${updated.type} from=${updated.from} to=${updated.to}`);
+    if (result.matchedCount > 0) {
+      console.log(`📬 STATUS [${status.id}] → ${status.status}`);
     } else {
-      // Record doesn't exist yet (status=sent race) — sendAndSave will write it shortly.
-      // The status will be set to 'sent' by sendAndSave itself, so nothing is lost.
-      console.log(`📬 STATUS [${status.id}] → ${status.status} (record not yet written by sendAndSave — skipping)`);
+      console.log(`📬 STATUS [${status.id}] → ${status.status} (no record yet — sendAndSave will write it)`);
     }
   } catch (err) {
     console.error(`⚠️  Status update(${status.id}): ${err.message}`);
