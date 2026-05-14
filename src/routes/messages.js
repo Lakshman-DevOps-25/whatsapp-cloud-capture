@@ -3,6 +3,7 @@
  */
 
 import express   from 'express';
+import mongoose  from 'mongoose';
 import multer    from 'multer';
 import path      from 'path';
 import os        from 'os';
@@ -54,8 +55,6 @@ router.get('/', async (req, res) => {
     if (req.query.type)      filter.type = req.query.type;
     if (req.query.direction) filter.direction = req.query.direction;
     if (req.query.status)    filter.status    = req.query.status;
-    // if (req.query.body)      filter.body      = req.query.body;
-    filter.body = "Sample Body";
     const [messages, total] = await Promise.all([
       Message.find(filter).sort({ waTimestamp: -1 }).skip((page - 1) * limit).limit(limit).lean(),
       Message.countDocuments(filter),
@@ -73,8 +72,6 @@ router.get('/outbound', async (req, res) => {
     if (req.query.type)   filter.type = req.query.type;
     if (req.query.status) filter.status = req.query.status;
     if (req.query.to)     filter.to     = req.query.to;
-    // if (req.query.body)   filter.body   = req.query.body;
-    filter.body = "Sample Body Message";
     const [messages, total] = await Promise.all([
       Message.find(filter).sort({ waTimestamp: -1 }).skip((page - 1) * limit).limit(limit).lean(),
       Message.countDocuments(filter),
@@ -198,18 +195,33 @@ router.get('/:id', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /api/send/text
-// Body (JSON):      { "to": "919876543210", "text": "Hello" }
 router.post('/send/text', async (req, res) => {
+  console.log(`\n${'='.repeat(50)}`);
+  console.log(`[POST /send/text] body:`, JSON.stringify(req.body));
+  console.log(`[POST /send/text] mongoose readyState=${mongoose.connection.readyState}`);
+  console.log(`[POST /send/text] db=${mongoose.connection.db?.databaseName}`);
   try {
-    console.log(`\n[POST /send/text] body:`, req.body);
     const { to, text } = req.body;
     if (!to)   return res.status(400).json({ error: 'to is required' });
     if (!text) return res.status(400).json({ error: 'text is required' });
+
+    // Direct DB write test BEFORE calling sendText
+    try {
+      const col    = mongoose.connection.db.collection('messages');
+      const testId = `route_test_${Date.now()}`;
+      await col.insertOne({ messageId: testId, direction: 'outbound', type: 'text', body: text, to, from: process.env.WA_BUSINESS_PHONE, status: 'test', createdAt: new Date() });
+      console.log(`[POST /send/text] ✅ Direct DB write OK testId=${testId}`);
+      await col.deleteOne({ messageId: testId });
+    } catch (dbTestErr) {
+      console.error(`[POST /send/text] ❌ Direct DB write FAILED: ${dbTestErr.message}`);
+    }
+
     const result = await sendText(to, text);
+    console.log(`[POST /send/text] ✅ sendText complete`);
     res.json(result);
   } catch (err) {
-    console.error(`[POST /send/text] ERROR:`, err.message);
-    console.error(`[ROUTE ERROR] ${err.message}`, err.stack);
+    console.error(`[POST /send/text] ❌ ERROR: ${err.message}`);
+    console.error(err.stack);
     res.status(500).json({ error: err.message });
   }
 });

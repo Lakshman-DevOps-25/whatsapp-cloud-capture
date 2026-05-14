@@ -94,8 +94,16 @@ async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
   if (extraFields.location)   doc.location   = extraFields.location;
   if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
-  // 3. Save to MongoDB — same function as inbound
-  await saveMessage(doc);
+  // 3. Save to MongoDB
+  console.log(`   [3] Calling saveMessage type=${msgType} to=${toPhone}`);
+  try {
+    await saveMessage(doc);
+    console.log(`   [4] saveMessage OK`);
+  } catch (saveErr) {
+    console.error(`   ❌ saveMessage THREW: ${saveErr.message}`);
+    console.error(`      Stack: ${saveErr.stack}`);
+    throw saveErr;
+  }
 
   // 4. Upsert contact
   await upsertContact(toPhone);
