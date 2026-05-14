@@ -31,18 +31,48 @@ async function postMessage(payload) {
   return data;
 }
 
-// ─── Save to MongoDB — exact same pattern as inbound in webhook.js ────────────
+// ─── Save to MongoDB — tries Message.collection first, falls back to mongoose.connection.db ──
 async function saveMessage(doc) {
   const now = new Date();
-  console.log(`   💾 Saving: messageId=${doc.messageId} type=${doc.type} direction=${doc.direction} from=${doc.from} to=${doc.to}`);
-  const col = mongoose.connection.db.collection('messages');
-  const result = await col.updateOne(
-    { messageId: doc.messageId },
-    { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
-    { upsert: true }
-  );
-  console.log(`   ✅ Saved: matched=${result.matchedCount} upserted=${result.upsertedCount} type=${doc.type}`);
-  return result;
+  const setDoc = { ...doc, updatedAt: now };
+  const filter = { messageId: doc.messageId };
+  const update = { $set: setDoc, $setOnInsert: { createdAt: now } };
+  const opts   = { upsert: true };
+
+  console.log(`   💾 Saving: messageId=${doc.messageId} type=${doc.type} from=${doc.from} to=${doc.to}`);
+  console.log(`   💾 mongoose readyState=${mongoose.connection.readyState} db=${mongoose.connection.db?.databaseName}`);
+
+  let result;
+
+  // Method 1: Message.collection (Mongoose model collection — used by inbound webhook)
+  try {
+    result = await mongoose.connection.db.collection('messages').updateOne(filter, update, opts);
+    console.log(`   ✅ Saved via mongoose.connection.db: matched=${result.matchedCount} upserted=${result.upsertedCount}`);
+    return result;
+  } catch (err1) {
+    console.error(`   ⚠️  mongoose.connection.db failed: ${err1.message}`);
+  }
+
+  // Method 2: Message.collection (Mongoose model)
+  try {
+    const { default: Message } = await import('../models/Message.js');
+    result = await Message.collection.updateOne(filter, update, opts);
+    console.log(`   ✅ Saved via Message.collection: matched=${result.matchedCount} upserted=${result.upsertedCount}`);
+    return result;
+  } catch (err2) {
+    console.error(`   ⚠️  Message.collection failed: ${err2.message}`);
+  }
+
+  // Method 3: Mongoose findOneAndUpdate (last resort)
+  try {
+    const { default: Message } = await import('../models/Message.js');
+    const saved = await Message.collection.findOneAndUpdate(filter, { $set: setDoc }, { upsert: true, returnDocument: 'after' });
+    console.log(`   ✅ Saved via findOneAndUpdate: _id=${saved?._id}`);
+    return saved;
+  } catch (err3) {
+    console.error(`   ❌ ALL save methods failed: ${err3.message}`);
+    throw err3;
+  }
 }
 
 // ─── Upsert contact ───────────────────────────────────────────────────────────

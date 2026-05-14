@@ -140,7 +140,9 @@ router.get('/test-db', async (req, res) => {
 
   try {
     const mongoose = (await import('mongoose')).default;
-    results.mongooseState = `readyState=${mongoose.connection.readyState} (1=connected)`;
+    const dbName   = mongoose.connection.db?.databaseName || 'unknown';
+    const collName = Message.collection?.name || 'unknown';
+    results.mongooseState = `readyState=${mongoose.connection.readyState} db=${dbName} collection=${collName}`;
 
     const testId = `test_${Date.now()}`;
     const from   = process.env.WA_BUSINESS_PHONE || 'test_business';
@@ -158,9 +160,9 @@ router.get('/test-db', async (req, res) => {
       results.mongooseWrite = `FAILED: ${e.message}`;
     }
 
-    // Test 2: Raw collection write (what sendToDb uses)
+    // Test 2: Raw collection write via mongoose.connection.db (what whatsappService uses)
     try {
-      const col = Message.collection;
+      const col = mongoose.connection.db.collection('messages');
       const r = await col.updateOne(
         { messageId: testId + '_raw' },
         { $set: { messageId: testId + '_raw', direction: 'outbound', from, to: 'test_customer', type: 'text', body: 'raw test', waTimestamp: new Date(), status: 'sent', createdAt: new Date(), updatedAt: new Date() } },
