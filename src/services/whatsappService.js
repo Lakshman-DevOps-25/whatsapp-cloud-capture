@@ -62,7 +62,7 @@ async function saveToDb(messageId, direction, fromPhone, toPhone, msgType, statu
   // Use raw collection — no Mongoose validation/casting that drops 'type'
   await Message.collection.updateOne(
     { messageId },
-    { $set: rawDoc, $setOnInsert: { _id: new (await import('mongoose')).default.Types.ObjectId() } },
+    { $set: rawDoc },
     { upsert: true }
   );
 
