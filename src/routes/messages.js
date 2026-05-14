@@ -184,12 +184,180 @@ router.get('/test-db', async (req, res) => {
   res.json(results);
 });
 
+
+// POST /api/write-test — writes directly to DB and returns result
+// Use this to confirm DB write works from your app
+router.post('/write-test', async (req, res) => {
+  try {
+    const { default: Message } = await import('../models/Message.js');
+    const testId = `writetest_${Date.now()}`;
+    const doc = {
+      messageId:   testId,
+      direction:   'outbound',
+      type:        'text',
+      from:        process.env.WA_BUSINESS_PHONE || 'test',
+      to:          req.body.to || 'test_customer',
+      body:        req.body.text || 'write test',
+      status:      'sent',
+      waTimestamp: new Date(),
+    };
+    const result = await Message.collection.updateOne(
+      { messageId: testId },
+      { $set: { ...doc, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+      { upsert: true }
+    );
+    const readBack = await Message.collection.findOne({ messageId: testId });
+    res.json({
+      success:     true,
+      matched:     result.matchedCount,
+      upserted:    result.upsertedCount,
+      savedDoc:    readBack,
+      dbName:      Message.collection.conn.db.databaseName,
+      collName:    Message.collection.name,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message, stack: err.stack });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const message = await Message.findOne({ messageId: req.params.id }).lean();
     if (!message) return res.status(404).json({ error: 'Message not found' });
     res.json(message);
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/send  — Universal send endpoint, routes by "type" field
+//
+// Accepts the exact WhatsApp Cloud API JSON format:
+//
+//   Text:
+//     { "messaging_product":"whatsapp", "to":"919...", "type":"text",
+//       "text": { "body": "Hello" } }
+//
+//   Image by URL:
+//     { "messaging_product":"whatsapp", "to":"919...", "type":"image",
+//       "image": { "link": "https://...", "caption": "..." } }
+//
+//   Image by media ID:
+//     { "messaging_product":"whatsapp", "to":"919...", "type":"image",
+//       "image": { "id": "media_id", "caption": "..." } }
+//
+//   Video:
+//     { "messaging_product":"whatsapp", "to":"919...", "type":"video",
+//       "video": { "link": "https://...", "caption": "..." } }
+//
+//   Audio:
+//     { "messaging_product":"whatsapp", "to":"919...", "type":"audio",
+//       "audio": { "link": "https://..." } }
+//
+//   Document:
+//     { "messaging_product":"whatsapp", "to":"919...", "type":"document",
+//       "document": { "link": "https://...", "filename": "file.pdf", "caption": "..." } }
+//
+//   Location:
+//     { "messaging_product":"whatsapp", "to":"919...", "type":"location",
+//       "location": { "latitude": 17.38, "longitude": 78.48, "name": "...", "address": "..." } }
+//
+//   Template:
+//     { "messaging_product":"whatsapp", "to":"919...", "type":"template",
+//       "template": { "name": "hello_world", "language": { "code": "en_US" } } }
+//
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/send', upload.single('media'), async (req, res) => {
+  try {
+    console.log(`\n📨 POST /api/send body:`, JSON.stringify(req.body));
+    const { to, type } = req.body;
+
+    if (!to)   return res.status(400).json({ error: '"to" is required' });
+    if (!type) return res.status(400).json({ error: '"type" is required (text/image/video/audio/document/location/template)' });
+
+    let result;
+
+    switch (type) {
+
+      case 'text': {
+        const raw  = req.body.text;
+        const body = typeof raw === 'object' ? raw?.body : raw;
+        if (!body) return res.status(400).json({ error: '"text.body" is required for type=text' });
+        result = await sendText(to, body);
+        break;
+      }
+
+      case 'image': {
+        const img     = req.body.image || {};
+        const caption = img.caption || req.body.caption || '';
+        const url     = img.link    || req.body.url     || '';
+        const mediaId = img.id      || req.body.mediaId || '';
+        const opts    = { caption, url: url || undefined, mediaId: mediaId || undefined };
+        if (req.file) { opts.filePath = req.file.path; opts.mimeType = req.file.mimetype; }
+        if (!url && !mediaId && !req.file) return res.status(400).json({ error: 'image.link, image.id, or file upload required' });
+        result = await sendImage(to, opts);
+        break;
+      }
+
+      case 'video': {
+        const vid     = req.body.video || {};
+        const caption = vid.caption || req.body.caption || '';
+        const url     = vid.link    || req.body.url     || '';
+        const mediaId = vid.id      || req.body.mediaId || '';
+        const opts    = { caption, url: url || undefined, mediaId: mediaId || undefined };
+        if (req.file) { opts.filePath = req.file.path; opts.mimeType = req.file.mimetype; }
+        if (!url && !mediaId && !req.file) return res.status(400).json({ error: 'video.link, video.id, or file upload required' });
+        result = await sendVideo(to, opts);
+        break;
+      }
+
+      case 'audio': {
+        const aud     = req.body.audio || {};
+        const url     = aud.link  || req.body.url     || '';
+        const mediaId = aud.id    || req.body.mediaId || '';
+        const opts    = { url: url || undefined, mediaId: mediaId || undefined };
+        if (req.file) { opts.filePath = req.file.path; opts.mimeType = req.file.mimetype; }
+        if (!url && !mediaId && !req.file) return res.status(400).json({ error: 'audio.link, audio.id, or file upload required' });
+        result = await sendAudio(to, opts);
+        break;
+      }
+
+      case 'document': {
+        const doc      = req.body.document || {};
+        const caption  = doc.caption  || req.body.caption  || '';
+        const fileName = doc.filename || req.body.fileName || '';
+        const url      = doc.link     || req.body.url      || '';
+        const mediaId  = doc.id       || req.body.mediaId  || '';
+        const opts     = { caption, fileName, url: url || undefined, mediaId: mediaId || undefined };
+        if (req.file) { opts.filePath = req.file.path; opts.mimeType = req.file.mimetype; opts.fileName = opts.fileName || req.file.originalname; }
+        if (!url && !mediaId && !req.file) return res.status(400).json({ error: 'document.link, document.id, or file upload required' });
+        result = await sendDocument(to, opts);
+        break;
+      }
+
+      case 'location': {
+        const loc = req.body.location || {};
+        if (!loc.latitude || !loc.longitude) return res.status(400).json({ error: 'location.latitude and location.longitude are required' });
+        result = await sendLocation(to, { latitude: loc.latitude, longitude: loc.longitude, name: loc.name || '', address: loc.address || '' });
+        break;
+      }
+
+      case 'template': {
+        const tmpl = req.body.template || {};
+        if (!tmpl.name) return res.status(400).json({ error: 'template.name is required' });
+        result = await sendTemplate(to, tmpl.name, tmpl.language?.code || 'en_US', tmpl.components || []);
+        break;
+      }
+
+      default:
+        return res.status(400).json({ error: `Unsupported type: "${type}". Use: text, image, video, audio, document, location, template` });
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error(`[POST /api/send] ERROR:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
