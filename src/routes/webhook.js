@@ -254,12 +254,13 @@ async function handleStatus(status) {
       update.errorCode    = status.errors[0].code?.toString();
       update.errorMessage = status.errors[0].title;
     }
-
+    console.log("Status.id: ", status.id);
     const { default: Msg } = await import('../models/Message.js');
     const result = await Msg.collection.updateOne(
       { messageId: status.id },
       { $set: { ...update, updatedAt: new Date() } }
     );
+    console.log("Result: ", $result);
 
     if (result.matchedCount > 0) {
       console.log(`📬 STATUS [${status.id.slice(-10)}] → ${status.status}`);
