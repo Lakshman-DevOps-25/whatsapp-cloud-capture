@@ -248,13 +248,14 @@ async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
 // sendAndSave() is the sole writer of outbound records.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleStatus(status) {
+  console.log("Status.id: ", status.id);
   try {
     const update = { status: status.status };
     if (status.errors?.[0]) {
       update.errorCode    = status.errors[0].code?.toString();
       update.errorMessage = status.errors[0].title;
     }
-    console.log("Status.id: ", status.id);
+    
     const { default: Msg } = await import('../models/Message.js');
     const result = await Msg.collection.updateOne(
       { messageId: status.id },
