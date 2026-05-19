@@ -57,6 +57,7 @@ router.post('/', async (req, res) => {
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value;
+        console.log("Value after webhook post: ", value);
         if (!value) continue;
 
         // messages[] = inbound from customer (direction always = inbound)
