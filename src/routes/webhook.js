@@ -257,7 +257,8 @@ async function handleStatus(status) {
       update.errorMessage = status.errors[0].title;
     }
     
-    const { default: Msg } = await import('../models/Message.js');
+    // const { default: Msg } = await import('../models/Message.js');
+    const Msg = mongoose.connection.db.collection('messages');
 
     const filter = { messageId: status.id };
 
@@ -286,10 +287,11 @@ async function handleStatus(status) {
       // Retry after 1.5s — saveMessage will have written the record by then
       setTimeout(async () => {
         try {
-          const r = await col.updateOne(
+          const r = await Msg.updateOne(
             { messageId: status.id },
             { $set: { ...update, updatedAt: new Date() } }
           );
+          console.log("📬 RETRY STATUS :", r);
           if (r.matchedCount > 0) {
             console.log(`📬 STATUS [${status.id.slice(-10)}] → sent (applied on retry)`);
           }
