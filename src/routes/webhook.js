@@ -258,10 +258,25 @@ async function handleStatus(status) {
     }
     
     const { default: Msg } = await import('../models/Message.js');
-    const result = await Msg.collection.updateOne(
-      { messageId: status.id },
-      { $set: { ...update, updatedAt: new Date() } }
-    );
+
+    const filter = { messageId: status.id };
+
+    const updateQuery = {
+      $set: {
+        ...update,
+        updatedAt: new Date()
+      }
+    };
+    
+    console.log("MongoDB Query:");
+    console.log(JSON.stringify({ filter, update: updateQuery }, null, 2));
+    
+    const result = await Msg.collection.updateOne(filter, updateQuery);
+    
+    // const result = await Msg.collection.updateOne(
+    //   { messageId: status.id },
+    //   { $set: { ...update, updatedAt: new Date() } }
+    // );
     console.log("Result: ", $result);
 
     if (result.matchedCount > 0) {
