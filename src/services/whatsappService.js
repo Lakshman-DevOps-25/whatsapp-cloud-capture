@@ -29,11 +29,21 @@ async function saveMessage(doc) {
 
   console.log(`   💾 saveMessage: id=${doc.messageId} type=${doc.type} from=${doc.from} to=${doc.to}`);
 
-  const result = await Message.collection.updateOne(
-    { messageId: doc.messageId },
-    { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
-    { upsert: true }
-  );
+  // If duplicate key (status webhook raced us), fall to updateOne
+  try {
+    await Message.collection.insertOne({ ...doc, createdAt, updatedAt });
+    // → type='text', body='hello', from='919...', to='918...' all saved ✅
+  } catch (err) {
+    if (err.code === 11000) {
+      // Already exists — just update
+      await Message.collection.updateOne({ messageId }, { $set: doc });
+    }
+  }
+  // const result = await Message.collection.updateOne(
+  //   { messageId: doc.messageId },
+  //   { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
+  //   { upsert: true }
+  // );
 
   console.log(`   ✅ saveMessage OK: matched=${result.matchedCount} upserted=${result.upsertedCount}`);
   return result;
