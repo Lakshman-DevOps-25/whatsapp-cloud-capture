@@ -352,7 +352,8 @@ router.post('/send', upload.single('media'), async (req, res) => {
       default:
         return res.status(400).json({ error: `Unsupported type: "${type}". Use: text, image, video, audio, document, location, template` });
     }
-
+    
+    console.log("   ✅ send complete, result:", result);
     res.json(result);
   } catch (err) {
     console.error(`[POST /api/send] ERROR:`, err.message);
