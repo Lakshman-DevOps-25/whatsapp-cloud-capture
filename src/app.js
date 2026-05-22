@@ -3,6 +3,7 @@ import express from 'express';
 import morgan from 'morgan';
 import { connectDB } from './config/db.js';
 import { validateMediaConfig } from './services/mediaService.js';
+import { startTokenAutoRenewal } from './services/tokenService.js';
 import webhookRouter  from './routes/webhook.js';
 import messagesRouter from './routes/messages.js';
 
@@ -46,7 +47,10 @@ async function boot() {
   // 1. Connect MongoDB
   await connectDB();
 
-  // 2. Validate media storage config (logs what backend is active)
+  // 2. Start token auto-renewal (checks every 24h, renews at 50-day mark)
+  startTokenAutoRenewal({ renewAfterDays: 50, checkEveryHours: 24 });
+
+  // 3. Validate media storage config (logs what backend is active)
   //    Does NOT connect to MinIO — just checks env vars are present
   try {
     validateMediaConfig();
