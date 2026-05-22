@@ -99,6 +99,7 @@ async function inspectToken(token) {
     timeout: 10000,
   });
 
+  console.log("inspectToken - ", data.data);
   return data.data; // { is_valid, expires_at, scopes, app_id, user_id, ... }
 }
 
