@@ -4,30 +4,14 @@
  * Manages WhatsApp Business API long-lived access tokens (60-day validity).
  *
  * HOW TOKEN PERSISTENCE WORKS:
- *
- *   LOCAL DEV  → writes to .env file on disk ✅
- *   RENDER     → updates Render env var via Render API ✅ (persists across restarts)
- *   RAILWAY    → updates Railway env var via Railway API ✅
- *   FALLBACK   → updates process.env only (lost on restart, but works until then)
- *
- * The correct approach per environment is auto-detected from env vars.
- *
- * SETUP — add to Render/Railway environment variables:
- *   WA_APP_ID             = your Meta App ID
- *   WA_APP_SECRET         = your Meta App Secret
- *   ADMIN_SECRET          = secret to protect admin endpoints
- *   RENDER_API_KEY        = Render API key (if deploying on Render)
- *   RENDER_SERVICE_ID     = Render service ID (if deploying on Render)
- *   WA_TOKEN_GENERATED_AT = (auto-set, do not edit manually)
+ *   All WA config is stored in MongoDB (configs collection).
+ *   loadConfigFromDB() in configService.js loads them into process.env at boot.
+ *   When a token is renewed, persistToken() saves it back to MongoDB.
+ *   This works identically on Render, Railway, local — no .env or Render API needed.
  */
 
 import axios from 'axios';
-import fs    from 'fs';
-import path  from 'path';
-import { fileURLToPath } from 'url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ENV_FILE  = path.resolve(__dirname, '../../.env');
+import { saveConfigToDB } from './configService.js';
 
 const REQUIRED_PERMISSIONS = [
   'whatsapp_business_messaging',
@@ -36,90 +20,11 @@ const REQUIRED_PERMISSIONS = [
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PERSISTENT TOKEN STORAGE
-// Tries three strategies in order:
-//   1. Render API  — persists across restarts on Render
-//   2. .env file   — persists on local dev
-//   3. process.env — in-memory only (lost on restart)
+// PERSISTENT TOKEN STORAGE — saves to MongoDB + process.env
 // ─────────────────────────────────────────────────────────────────────────────
-
 async function persistToken(key, value) {
-  // Always update in-memory immediately — works for current process
-  process.env[key] = value;
-  console.log(`   ✅ [TokenService] ${key} updated in process.env (live)`);
-
-  // Strategy 1: Render API (production on Render)
-  if (process.env.RENDER_API_KEY && process.env.RENDER_SERVICE_ID) {
-    const updated = await updateRenderEnvVar(key, value);
-    if (updated) return;
-  }
-
-  // Strategy 2: .env file (local development)
-  if (fs.existsSync(ENV_FILE)) {
-    updateEnvFile(key, value);
-    return;
-  }
-
-  // Strategy 3: process.env only (already done above)
-  console.warn(`   ⚠️  [TokenService] ${key} updated in memory only — will be lost on restart`);
-  console.warn(`      To persist: set RENDER_API_KEY + RENDER_SERVICE_ID in Render env vars`);
-}
-
-// ── Strategy 1: Update via Render API ─────────────────────────────────────────
-async function updateRenderEnvVar(key, value) {
-  try {
-    const serviceId = process.env.RENDER_SERVICE_ID;
-    const apiKey    = process.env.RENDER_API_KEY;
-
-    // Step 1: Get existing env vars from Render
-    const listRes = await axios.get(
-      `https://api.render.com/v1/services/${serviceId}/env-vars`,
-      { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }, timeout: 10000 }
-    );
-
-    // Step 2: Build updated env vars list
-    const existing = listRes.data || [];
-    let updated = false;
-    const envVars = existing.map(ev => {
-      if (ev.envVar?.key === key) {
-        updated = true;
-        return { key, value };
-      }
-      return { key: ev.envVar?.key, value: ev.envVar?.value };
-    });
-
-    if (!updated) envVars.push({ key, value });
-
-    // Step 3: PUT updated vars back to Render
-    await axios.put(
-      `https://api.render.com/v1/services/${serviceId}/env-vars`,
-      envVars,
-      { headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, timeout: 10000 }
-    );
-
-    console.log(`   ✅ [TokenService] ${key} updated in Render environment variables (persists across restarts)`);
-    return true;
-  } catch (err) {
-    console.error(`   ⚠️  [TokenService] Render API update failed: ${err.response?.data?.message || err.message}`);
-    console.error(`      Check RENDER_API_KEY and RENDER_SERVICE_ID are correct`);
-    return false;
-  }
-}
-
-// ── Strategy 2: Update .env file (local dev) ──────────────────────────────────
-function updateEnvFile(key, value) {
-  try {
-    let content = fs.readFileSync(ENV_FILE, 'utf8');
-    if (content.includes(`${key}=`)) {
-      content = content.replace(new RegExp(`^${key}=.*$`, 'm'), `${key}=${value}`);
-    } else {
-      content += `\n${key}=${value}`;
-    }
-    fs.writeFileSync(ENV_FILE, content, 'utf8');
-    console.log(`   ✅ [TokenService] ${key} updated in .env file`);
-  } catch (err) {
-    console.warn(`   ⚠️  [TokenService] Could not write .env file: ${err.message}`);
-  }
+  await saveConfigToDB(key, value);   // saves to MongoDB AND process.env
+  console.log(`   ✅ [TokenService] ${key} persisted to MongoDB`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,15 +148,7 @@ export function startTokenAutoRenewal(opts = {}) {
 
   console.log(`\n🔄 [TokenService] Auto-renewal started (renews at day ${renewAfterDays}, checks every ${checkEveryHours}h)\n`);
 
-  // Log where tokens will be persisted
-  if (process.env.RENDER_API_KEY && process.env.RENDER_SERVICE_ID) {
-    console.log(`   💾 Token persistence: Render API (survives restarts ✅)`);
-  } else if (fs.existsSync(ENV_FILE)) {
-    console.log(`   💾 Token persistence: .env file (local dev ✅)`);
-  } else {
-    console.warn(`   ⚠️  Token persistence: process.env only (lost on restart)`);
-    console.warn(`      Add RENDER_API_KEY + RENDER_SERVICE_ID to enable persistent renewal`);
-  }
+  console.log(`   💾 Token persistence: MongoDB (configs collection) ✅`);
 
   const checkAndRenew = async () => {
     try {
@@ -315,8 +212,6 @@ export async function handleTokenStatus(req, res) {
       missing   = REQUIRED_PERMISSIONS.filter(p => !(tokenInfo.scopes||[]).includes(p));
     } catch (_) {}
 
-    const renderConfigured = !!(process.env.RENDER_API_KEY && process.env.RENDER_SERVICE_ID);
-
     res.json({
       tokenSet:          !!token,
       tokenPrefix:       token ? token.substring(0, 20) + '...' : null,
@@ -351,11 +246,7 @@ export async function handleRefreshToken(req, res) {
       expiresInDays: result.expiresInDays,
       permissions:   perms.scopes,
       missing:       perms.missing,
-      persistence:   (process.env.RENDER_API_KEY && process.env.RENDER_SERVICE_ID)
-                       ? 'Saved to Render env vars (permanent)'
-                       : fs.existsSync(ENV_FILE)
-                         ? 'Saved to .env file'
-                         : 'Saved to process.env only (temporary — add RENDER_API_KEY to make permanent)',
+      persistence:   'Saved to MongoDB (configs collection)',
     });
   } catch (err) {
     console.error('[handleRefreshToken]', err.message);
@@ -381,11 +272,7 @@ export async function handleUpdateToken(req, res) {
       message:     'Token updated',
       permissions: perms.scopes,
       missing:     perms.missing,
-      persistence: (process.env.RENDER_API_KEY && process.env.RENDER_SERVICE_ID)
-                     ? 'Saved to Render env vars (permanent)'
-                     : fs.existsSync(ENV_FILE)
-                       ? 'Saved to .env file'
-                       : 'Saved to process.env only (temporary)',
+      persistence: 'Saved to MongoDB (configs collection)',
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
