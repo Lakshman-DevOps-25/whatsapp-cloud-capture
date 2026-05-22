@@ -315,7 +315,7 @@ export function startTokenAutoRenewal(opts = {}) {
         }
       }
 
-      return `🔑 [TokenService] Token age: ${ageInDays} days | Renews at: ${renewAfterDays} days | ${daysUntilRenew > 0 ? `Next renewal in ${daysUntilRenew} day(s)` : 'RENEWAL DUE'}`;
+      // return `🔑 [TokenService] Token age: ${ageInDays} days | Renews at: ${renewAfterDays} days | ${daysUntilRenew > 0 ? `Next renewal in ${daysUntilRenew} day(s)` : 'RENEWAL DUE'}`;
 
     } catch (err) {
       console.error('⚠️  [TokenService] Renewal check error:', err.message);
@@ -323,7 +323,7 @@ export function startTokenAutoRenewal(opts = {}) {
   };
 
   // Run once immediately on startup to log token status
-  return checkAndRenew();
+  checkAndRenew();
 
   // Then run on schedule
   setInterval(checkAndRenew, intervalMs);
