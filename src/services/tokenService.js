@@ -315,13 +315,15 @@ export function startTokenAutoRenewal(opts = {}) {
         }
       }
 
+      return `🔑 [TokenService] Token age: ${ageInDays} days | Renews at: ${renewAfterDays} days | ${daysUntilRenew > 0 ? `Next renewal in ${daysUntilRenew} day(s)` : 'RENEWAL DUE'}`;
+
     } catch (err) {
       console.error('⚠️  [TokenService] Renewal check error:', err.message);
     }
   };
 
   // Run once immediately on startup to log token status
-  checkAndRenew();
+  return checkAndRenew();
 
   // Then run on schedule
   setInterval(checkAndRenew, intervalMs);
