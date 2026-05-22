@@ -327,31 +327,11 @@ export function startTokenAutoRenewal(opts = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ADMIN API ROUTES — mount in messages.js or a dedicated admin router
+// ADMIN ROUTE HANDLERS — already wired into messages.js
+// GET  /api/admin/token-status
+// POST /api/admin/refresh-token
+// POST /api/admin/update-token
 // ─────────────────────────────────────────────────────────────────────────────
-/**
- * Returns an Express router with admin endpoints for token management.
- * Mount it in app.js: app.use('/api/admin', tokenAdminRouter());
- *
- * Endpoints:
- *   GET  /api/admin/token-status       — current token info + permissions
- *   POST /api/admin/refresh-token      — exchange current token for new 60-day token
- *   POST /api/admin/update-token       — manually set a new token (from Postman)
- *
- * All endpoints require the ADMIN_SECRET header or body field.
- */
-export function tokenAdminRouter() {
-  // Dynamic import to avoid circular dependencies
-  const { Router } = await_import_express();
-
-  function await_import_express() {
-    // Synchronous workaround — express is already loaded in app.js
-    return { Router: (await import('express')).Router };
-  }
-}
-
-// ── Simpler approach: export individual route handlers ────────────────────────
-// Add these to your existing messages.js router
 
 /**
  * GET /api/admin/token-status
