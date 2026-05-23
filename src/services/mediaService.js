@@ -92,13 +92,53 @@ export function validateMediaConfig() {
 }
 
 // ── Resolve WhatsApp media download URL ──────────────────────────────────────
+// export async function resolveMediaUrl(mediaId) {
+//   const { data } = await axios.get(`${BASE_URL()}/${mediaId}`, {
+//     headers: { Authorization: `Bearer ${TOKEN()}` },
+//     timeout: 15000,
+//   });
+//   return data;
+// }
+
+// ── Resolve WhatsApp media download URL ──────────────────────────────────────
+// On 401: auto-refreshes the token once and retries before giving up
 export async function resolveMediaUrl(mediaId) {
-  const { data } = await axios.get(`${BASE_URL()}/${mediaId}`, {
-    headers: { Authorization: `Bearer ${TOKEN()}` },
-    timeout: 15000,
-  });
-  return data;
+  const fetchWithToken = async (tok) => {
+    const { data } = await axios.get(`${BASE_URL()}/${mediaId}`, {
+      headers: { Authorization: `Bearer ${tok}` },
+      timeout: 15000,
+    });
+    return data;
+  };
+
+  const token = TOKEN();
+  if (!token) throw new Error('WA_ACCESS_TOKEN is not set — seed it via POST /api/admin/config');
+
+  try {
+    return await fetchWithToken(token);
+  } catch (err) {
+    if (err.response?.status !== 401) throw err;
+
+    // ── 401: token expired — try to auto-refresh once ────────────────────────
+    console.warn(`   ⚠️  [MediaService] Token 401 on mediaId=${mediaId} — attempting auto-refresh...`);
+    try {
+      const { generateLongToken } = await import('./tokenService.js');
+      const result = await generateLongToken();
+      console.log(`   ✅ [MediaService] Token refreshed — retrying media download...`);
+      return await fetchWithToken(result.longToken);
+    } catch (refreshErr) {
+      // Refresh also failed — give clear actionable error
+      throw new Error(
+        `WA_ACCESS_TOKEN expired and auto-refresh failed.\n` +
+        `  Refresh error: ${refreshErr.message}\n` +
+        `  Manual fix: POST /api/admin/refresh-token?secret=YOUR_ADMIN_SECRET\n` +
+        `  Then re-seed: POST /api/admin/config with new WA_ACCESS_TOKEN\n` +
+        `  Token was: ${token.substring(0, 20)}...`
+      );
+    }
+  }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INTERNAL: stream → MinIO
