@@ -1,4 +1,4 @@
-version: '3.9'
+# version: '3.9'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Local development + production-ready stack:
@@ -45,7 +45,8 @@ services:
       # Set this to your server's public IP or domain (no protocol, no port if default).
       # e.g.  MINIO_SERVER_URL: https://media.yourdomain.com
       #       MINIO_SERVER_URL: http://203.0.113.10:9000
-      MINIO_SERVER_URL: http://localhost:9000   # ← change to your public IP/domain
+      # MINIO_SERVER_URL: http://localhost:9000   # ← change to your public IP/domain
+      MINIO_SERVER_URL: http://play.min.io:9000
     command: server /data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
