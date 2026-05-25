@@ -142,13 +142,13 @@ async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
 
 // ─── Store outbound media in MinIO then update DB ─────────────────────────────
 // Handles all three cases: filePath (upload), url (link), mediaId (WA CDN)
-async function storeOutboundMedia(messageId, opts, mimeType) {
+await function storeOutboundMedia(messageId, opts, mimeType) {
   console.log(`   📤 [OutboundMedia] storing: messageId=${messageId} mimeType=${mimeType}`);
   try {
     let stored = {};
     const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
 
-    if (opts.filePath) {
+    if (opts.filePath && fs.existsSync(opts.filePath)) {
       // Case 1: file was uploaded — store directly to MinIO from disk
       console.log(`   📁 Storing from filePath: ${opts.filePath}`);
       stored = await storeLocalFile(opts.filePath, mimeType);
