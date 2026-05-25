@@ -221,6 +221,13 @@ async function handleInbound(msg, value) {
 
 async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
   console.log(`\n   📥 Storing inbound media: mediaId=${mediaId}`);
+
+  // Check token is set before attempting download
+  if (!process.env.WA_ACCESS_TOKEN) {
+    console.error(`   ❌ WA_ACCESS_TOKEN not set — cannot download media ${mediaId}`);
+    return;
+  }
+
   try {
     const stored = await downloadAndStoreMedia(mediaId, mimeType, fileName);
 

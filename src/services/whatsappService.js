@@ -1,8 +1,10 @@
 import axios    from 'axios';
 import fs       from 'fs';
 import path     from 'path';
+import mongoose from 'mongoose';
 import FormData from 'form-data';
 import Contact  from '../models/Contact.js';
+import Message  from '../models/Message.js';
 import { mediaTypeFolder, downloadUrlAndStore, storeLocalFile } from './mediaService.js';
 
 const BASE_URL   = () => `https://graph.facebook.com/${process.env.WA_API_VERSION}/${process.env.WA_PHONE_NUMBER_ID}`;
@@ -20,23 +22,30 @@ async function postMessage(payload) {
 }
 
 // ─── Save to MongoDB ──────────────────────────────────────────────────────────
-// Import Message model inside the function to ensure it's called AFTER
-// mongoose is fully connected (avoids module-load-time connection issues)
 async function saveMessage(doc) {
-  // Dynamic import ensures we get the model AFTER mongoose is connected
-  const { default: Message } = await import('../models/Message.js');
-  const now = new Date();
-
   console.log(`   💾 saveMessage: id=${doc.messageId} type=${doc.type} from=${doc.from} to=${doc.to}`);
 
-  const result = await Message.collection.updateOne(
-    { messageId: doc.messageId },
-    { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
-    { upsert: true }
-  );
-
-  console.log(`   ✅ saveMessage OK: matched=${result.matchedCount} upserted=${result.upsertedCount}`);
-  return result;
+  // Use insertOne via mongoose model — cleanest way, works always after connectDB()
+  try {
+    await Message.collection.insertOne({
+      ...doc,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    console.log(`   ✅ DB inserted: type=${doc.type} from=${doc.from} to=${doc.to}`);
+  } catch (err) {
+    if (err.code === 11000) {
+      // Duplicate messageId — update instead
+      await Message.collection.updateOne(
+        { messageId: doc.messageId },
+        { $set: { ...doc, updatedAt: new Date() } }
+      );
+      console.log(`   ✅ DB updated (duplicate): type=${doc.type}`);
+    } else {
+      console.error(`   ❌ DB save error: ${err.message}`);
+      throw err;
+    }
+  }
 }
 
 // ─── Upsert contact ───────────────────────────────────────────────────────────
@@ -97,7 +106,7 @@ async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
   return { metaRes, realMessageId };
 }
 
-// ─── Store outbound media in MinIO ────────────────────────────────────────────
+// ─── Store outbound media in MinIO then update DB ─────────────────────────────
 async function storeOutboundMedia(messageId, opts, mimeType) {
   try {
     let stored = {};
@@ -108,7 +117,6 @@ async function storeOutboundMedia(messageId, opts, mimeType) {
       stored = await downloadUrlAndStore(opts.url, mimeType, prefix);
     }
     if (stored.minioUrl || stored.localPath) {
-      const { default: Message } = await import('../models/Message.js');
       const update = {};
       if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
       if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
@@ -268,7 +276,6 @@ export async function markRead(messageId) {
       { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
       { headers: { ...authHeader(), 'Content-Type': 'application/json' } }
     );
-    const { default: Message } = await import('../models/Message.js');
     await Message.collection.updateOne(
       { messageId },
       { $set: { status: 'read', updatedAt: new Date() } }

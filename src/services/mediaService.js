@@ -92,12 +92,67 @@ export function validateMediaConfig() {
 }
 
 // ── Resolve WhatsApp media download URL ──────────────────────────────────────
+// On 401: auto-refreshes the token once and retries before giving up
 export async function resolveMediaUrl(mediaId) {
-  const { data } = await axios.get(`${BASE_URL()}/${mediaId}`, {
-    headers: { Authorization: `Bearer ${TOKEN()}` },
-    timeout: 15000,
-  });
-  return data;
+  const fetchWithToken = async (tok) => {
+    const { data } = await axios.get(`${BASE_URL()}/${mediaId}`, {
+      headers: { Authorization: `Bearer ${tok}` },
+      timeout: 15000,
+    });
+    return data;
+  };
+
+  const token = TOKEN();
+  if (!token) throw new Error('WA_ACCESS_TOKEN is not set — seed it via POST /api/admin/config');
+
+  try {
+    return await fetchWithToken(token);
+  } catch (err) {
+    if (err.response?.status !== 401) throw err;
+
+    // ── 401: token expired — try to auto-refresh once ────────────────────────
+    console.warn(`   ⚠️  [MediaService] 401 on mediaId=${mediaId}`);
+    console.warn(`   ⚠️  Token prefix: ${token.substring(0, 20)}...`);
+    console.warn(`   ⚠️  WA_APP_ID set: ${!!process.env.WA_APP_ID}`);
+    console.warn(`   ⚠️  WA_APP_SECRET set: ${!!process.env.WA_APP_SECRET}`);
+
+    // Fetch WA_APP_ID and WA_APP_SECRET directly from MongoDB
+    // (process.env may not have them if loadConfigFromDB() hadn't run yet)
+    console.warn(`   🔄 [MediaService] Fetching credentials from MongoDB for token refresh...`);
+    try {
+      const { getConfig }       = await import('./configService.js');
+      const { generateLongToken } = await import('./tokenService.js');
+
+      // Load from MongoDB directly — guaranteed to have latest values
+      const appId     = await getConfig('WA_APP_ID');
+      const appSecret = await getConfig('WA_APP_SECRET');
+
+      console.warn(`   WA_APP_ID from MongoDB     : ${appId     ? appId.substring(0, 10) + '...' : '❌ NOT FOUND'}`);
+      console.warn(`   WA_APP_SECRET from MongoDB : ${appSecret ? 'SET' : '❌ NOT FOUND'}`);
+
+      if (!appId || !appSecret) {
+        throw new Error(
+          `WA_APP_ID or WA_APP_SECRET not found in MongoDB.\n` +
+          `  Fix: POST /api/admin/config with WA_APP_ID and WA_APP_SECRET`
+        );
+      }
+
+      // Set into process.env so generateLongToken() can use them
+      process.env.WA_APP_ID     = appId;
+      process.env.WA_APP_SECRET = appSecret;
+
+      const result   = await generateLongToken();
+      const newToken = result.longToken || process.env.WA_ACCESS_TOKEN;
+      console.log(`   ✅ [MediaService] Token refreshed — retrying media download`);
+      return await fetchWithToken(newToken);
+    } catch (refreshErr) {
+      throw new Error(
+        `WA_ACCESS_TOKEN expired and auto-refresh failed.\n` +
+        `  Error: ${refreshErr.message}\n` +
+        `  Manual fix: POST /api/admin/refresh-token?secret=YOUR_ADMIN_SECRET`
+      );
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

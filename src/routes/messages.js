@@ -3,6 +3,8 @@
  */
 
 import express   from 'express';
+import { handleTokenStatus, handleRefreshToken, handleUpdateToken } from '../services/tokenService.js';
+import { getAllConfig, saveConfigToDB, MANAGED_KEYS } from '../services/configService.js';
 import mongoose  from 'mongoose';
 import multer    from 'multer';
 import path      from 'path';
@@ -13,7 +15,7 @@ import Contact   from '../models/Contact.js';
 import {
   sendText, sendImage, sendVideo, sendAudio,
   sendDocument, sendSticker, sendLocation,
-  sendTemplate, sendButtons, sendList, uploadMedia,
+  sendTemplate, sendButtons, sendList, uploadMedia, markRead,
 } from '../services/whatsappService.js';
 
 const router = express.Router();
@@ -63,6 +65,112 @@ router.get('/', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/search  — Search messages across all fields
+//
+// Query params (all optional, combinable):
+//   q          full-text search across body, contactName, from, to
+//   phone      search by phone number (from OR to) — partial match
+//   from       exact or partial sender phone
+//   to         exact or partial recipient phone
+//   body       partial text in message body
+//   type       message type: text/image/video/audio/document etc.
+//   direction  inbound / outbound
+//   status     sent/delivered/read/received/failed
+//   from_date  ISO date start  e.g. 2024-01-01
+//   to_date    ISO date end    e.g. 2024-12-31
+//   has_media  true → only messages with media files
+//   has_minio  true → only messages with minioUrl stored
+//   page       default 1
+//   limit      default 50, max 200
+//
+// Examples:
+//   GET /api/search?q=hello
+//   GET /api/search?phone=919876543210
+//   GET /api/search?body=invoice&type=document
+//   GET /api/search?direction=outbound&status=read
+//   GET /api/search?from_date=2024-01-01&to_date=2024-12-31
+//   GET /api/search?has_media=true&direction=inbound
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/search', async (req, res) => {
+  try {
+    const page  = Math.max(parseInt(req.query.page  || '1'), 1);
+    const limit = Math.min(parseInt(req.query.limit || '50'), 200);
+    const skip  = (page - 1) * limit;
+
+    const filter = {};
+
+    // ── Full-text search across multiple fields ───────────────────────────────
+    if (req.query.q) {
+      const regex = { $regex: req.query.q, $options: 'i' };
+      filter.$or = [
+        { body:        regex },
+        { contactName: regex },
+        { from:        regex },
+        { to:          regex },
+        { 'media.fileName': regex },
+        { 'media.caption':  regex },
+      ];
+    }
+
+    // ── Phone number search (from OR to) ─────────────────────────────────────
+    if (req.query.phone) {
+      const phoneRegex = { $regex: req.query.phone, $options: 'i' };
+      // If $or already set from q, merge with $and
+      if (filter.$or) {
+        filter.$and = [
+          { $or: filter.$or },
+          { $or: [{ from: phoneRegex }, { to: phoneRegex }] },
+        ];
+        delete filter.$or;
+      } else {
+        filter.$or = [{ from: phoneRegex }, { to: phoneRegex }];
+      }
+    }
+
+    // ── Individual field filters ──────────────────────────────────────────────
+    if (req.query.from)      filter.from      = { $regex: req.query.from,  $options: 'i' };
+    if (req.query.to)        filter.to        = { $regex: req.query.to,    $options: 'i' };
+    if (req.query.body)      filter.body      = { $regex: req.query.body,  $options: 'i' };
+    if (req.query.type)      filter.type      = req.query.type;
+    if (req.query.direction) filter.direction = req.query.direction;
+    if (req.query.status)    filter.status    = req.query.status;
+
+    // ── Date range ────────────────────────────────────────────────────────────
+    if (req.query.from_date || req.query.to_date) {
+      filter.waTimestamp = {};
+      if (req.query.from_date) filter.waTimestamp.$gte = new Date(req.query.from_date);
+      if (req.query.to_date)   filter.waTimestamp.$lte = new Date(req.query.to_date + 'T23:59:59.999Z');
+    }
+
+    // ── Media filters ─────────────────────────────────────────────────────────
+    if (req.query.has_media === 'true') filter['media.mediaId'] = { $exists: true };
+    if (req.query.has_minio === 'true') filter['media.minioUrl'] = { $exists: true };
+
+    const [messages, total] = await Promise.all([
+      Message.find(filter)
+        .sort({ waTimestamp: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Message.countDocuments(filter),
+    ]);
+
+    res.json({
+      total,
+      page,
+      limit,
+      pages:    Math.ceil(total / limit),
+      query:    req.query,
+      messages,
+    });
+  } catch (err) {
+    console.error('[GET /api/search] ERROR:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/messages/outbound
 router.get('/outbound', async (req, res) => {
   try {
@@ -92,27 +200,100 @@ router.get('/media', async (req, res) => {
 });
 
 // GET /api/messages/contact/:phone
+// Returns full conversation thread between business and this customer phone number.
+// Messages from BOTH directions sorted oldest → newest (like WhatsApp chat view).
 router.get('/contact/:phone', async (req, res) => {
   try {
-    const { phone } = req.params;
-    const page  = Math.max(parseInt(req.query.page  || '1'), 1);
-    const limit = Math.min(parseInt(req.query.limit || '50'), 200);
+    // Decode phone correctly — handles +91... passed as %2B91 or plain +91
+    const rawPhone = (req.params.phone || '').replace(/\+/g, '%2B');
+    const phone    = decodeURIComponent(rawPhone).trim();
+    if (!phone) return res.status(400).json({ error: 'phone is required' });
+
+    const page    = Math.max(parseInt(req.query.page  || '1'), 1);
+    const limit   = Math.min(parseInt(req.query.limit || '100'), 500);
+    const myPhone = (process.env.WA_BUSINESS_PHONE || '').trim();
+
+    console.log(`[GET /contact/:phone] phone=${phone}`);
+
+    // Fetch thread + contact + total + mark all inbound as read — all in parallel
+    const filter = { $or: [{ from: phone }, { to: phone }] };
+
     const [messages, contact, total] = await Promise.all([
-      Message.find({ $or: [{ from: phone }, { to: phone }] }).sort({ waTimestamp: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      Message.find(filter)
+        .sort({ waTimestamp: 1 })   // oldest first — WhatsApp chat order
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
       Contact.findOne({ phone }).lean(),
-      Message.countDocuments({ $or: [{ from: phone }, { to: phone }] }),
+      Message.countDocuments(filter),
+      // Mark all unread inbound messages from this contact as read
+      Message.updateMany(
+        { from: phone, direction: 'inbound', status: 'received' },
+        { $set: { status: 'read', updatedAt: new Date() } }
+      ),
     ]);
-    res.json({ total, page, limit, contact, messages });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+
+    // Add isMine helper so frontend knows which side to render each message
+    const thread = messages.map(m => ({
+      ...m,
+      isMine: m.direction === 'outbound' || m.from === myPhone,
+    }));
+
+    console.log(`[GET /contact/:phone] found ${total} messages for ${phone}`);
+
+    res.json({
+      total,
+      page,
+      limit,
+      contact,
+      customerPhone: phone,
+      businessPhone: myPhone,
+      thread,
+    });
+  } catch (err) {
+    console.error('[GET /contact/:phone]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // /:id route moved to bottom — see end of READ section
 
 // GET /api/contacts/list
+// Returns all contacts with last message preview — like WhatsApp conversation list.
 router.get('/contacts/list', async (req, res) => {
   try {
     const contacts = await Contact.find().sort({ lastSeen: -1 }).lean();
-    res.json({ count: contacts.length, contacts });
+
+    // For each contact, get the last message in the conversation
+    const withPreview = await Promise.all(contacts.map(async (contact) => {
+      const lastMsg = await Message.findOne({
+        $or: [{ from: contact.phone }, { to: contact.phone }],
+      })
+        .sort({ waTimestamp: -1 })
+        .select('type body direction status waTimestamp media')
+        .lean();
+
+      // Count unread inbound messages (received but not read)
+      const unreadCount = await Message.countDocuments({
+        from:      contact.phone,
+        direction: 'inbound',
+        status:    'received',
+      });
+
+      return {
+        ...contact,
+        lastMessage: lastMsg ? {
+          type:        lastMsg.type,
+          body:        lastMsg.body || (lastMsg.media ? `[${lastMsg.type}]` : ''),
+          direction:   lastMsg.direction,
+          status:      lastMsg.status,
+          waTimestamp: lastMsg.waTimestamp,
+        } : null,
+        unreadCount,
+      };
+    }));
+
+    res.json({ count: withPreview.length, contacts: withPreview });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -360,6 +541,57 @@ router.post('/send', upload.single('media'), async (req, res) => {
   }
 });
 
+
+// GET /api/conversations
+// Same as contacts/list but supports search by phone or name.
+// This is the main entry point for the conversation list view.
+router.get('/conversations', async (req, res) => {
+  try {
+    const search = (req.query.q || '').trim();
+    const filter = search
+      ? { $or: [
+          { phone: { $regex: search, $options: 'i' } },
+          { name:  { $regex: search, $options: 'i' } },
+          { waId:  { $regex: search, $options: 'i' } },
+        ]}
+      : {};
+
+    const contacts = await Contact.find(filter).sort({ lastSeen: -1 }).lean();
+
+    const withPreview = await Promise.all(contacts.map(async (contact) => {
+      const lastMsg = await Message.findOne({
+        $or: [{ from: contact.phone }, { to: contact.phone }],
+      })
+        .sort({ waTimestamp: -1 })
+        .select('type body direction status waTimestamp media')
+        .lean();
+
+      const unreadCount = await Message.countDocuments({
+        from:      contact.phone,
+        direction: 'inbound',
+        status:    'received',
+      });
+
+      return {
+        phone:       contact.phone,
+        name:        contact.name || contact.phone,
+        lastSeen:    contact.lastSeen,
+        messageCount: contact.messageCount,
+        unreadCount,
+        lastMessage: lastMsg ? {
+          type:        lastMsg.type,
+          body:        lastMsg.body || (lastMsg.media ? `[${lastMsg.type}]` : ''),
+          direction:   lastMsg.direction,
+          status:      lastMsg.status,
+          waTimestamp: lastMsg.waTimestamp,
+        } : null,
+      };
+    }));
+
+    res.json({ count: withPreview.length, conversations: withPreview });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SEND ENDPOINTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -385,7 +617,7 @@ router.post('/send/text', async (req, res) => {
                     : rawText;              // use as plain string
 
     if (!to)   return res.status(400).json({ error: 'to is required' });
-    // if (!text) return res.status(400).json({ error: 'text is required' });
+    if (!text) return res.status(400).json({ error: 'text is required' });
 
     // Direct DB write test BEFORE calling sendText
     try {
@@ -592,6 +824,66 @@ router.post('/upload', upload.single('media'), async (req, res) => {
     const mediaId = await uploadMedia(req.file.path, mime);
     res.json({ mediaId, fileName: req.file.originalname, mimeType: mime });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOKEN ADMIN ROUTES
+// All require ADMIN_SECRET in query (?secret=xxx) or request body
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET  /api/admin/token-status   — view token info + permissions
+router.get('/admin/token-status',  handleTokenStatus);
+
+// POST /api/admin/refresh-token  — auto-exchange current token for new 60-day token
+router.post('/admin/refresh-token', handleRefreshToken);
+
+// POST /api/admin/update-token   — paste a new token manually
+// Body: { secret: "...", token: "EAAxxxxx" }
+router.post('/admin/update-token',  handleUpdateToken);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIG ADMIN ROUTES — manage WhatsApp env vars stored in MongoDB
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/admin/config — view all config values stored in MongoDB
+router.get('/admin/config', async (req, res) => {
+  const secret = req.query.secret || req.body?.secret;
+  if (secret !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  try {
+    const config = await getAllConfig();
+    res.json({ success: true, config });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/config — update one or more config values in MongoDB
+// Body: { secret: "...", WA_ACCESS_TOKEN: "EAAxx", WA_API_VERSION: "v19.0", ... }
+router.post('/admin/config', async (req, res) => {
+  const { secret, ...updates } = req.body;
+  if (secret !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  const allowed = Object.keys(updates).filter(k => MANAGED_KEYS.includes(k));
+  if (allowed.length === 0) {
+    return res.status(400).json({
+      error: 'No valid keys provided',
+      validKeys: MANAGED_KEYS,
+    });
+  }
+
+  const saved = [];
+  for (const key of allowed) {
+    await saveConfigToDB(key, updates[key]);
+    saved.push(key);
+  }
+
+  res.json({ success: true, saved, message: `${saved.length} config value(s) updated in MongoDB` });
 });
 
 
