@@ -142,13 +142,13 @@ async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
 
 // ─── Store outbound media in MinIO then update DB ─────────────────────────────
 // Handles all three cases: filePath (upload), url (link), mediaId (WA CDN)
-await storeOutboundMedia(messageId, opts, mimeType) {
+async function storeOutboundMedia(messageId, opts, mimeType) {
   console.log(`   📤 [OutboundMedia] storing: messageId=${messageId} mimeType=${mimeType}`);
   try {
     let stored = {};
     const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
 
-    if (opts.filePath && fs.existsSync(opts.filePath)) {
+    if (opts.filePath) {
       // Case 1: file was uploaded — store directly to MinIO from disk
       console.log(`   📁 Storing from filePath: ${opts.filePath}`);
       stored = await storeLocalFile(opts.filePath, mimeType);
@@ -236,7 +236,7 @@ export async function sendImage(to, { url, mediaId, caption = '', filePath, mime
     { messaging_product: 'whatsapp', to, type: 'image', image: imageObj },
     { body: caption, media: { mediaId: resolvedId, mimeType, caption } }
   );
-  storeOutboundMedia(realMessageId, { filePath, url, mediaId: resolvedId }, mimeType);
+  await storeOutboundMedia(realMessageId, { filePath, url, mediaId: resolvedId }, mimeType);
   return metaRes;
 }
 
@@ -251,7 +251,7 @@ export async function sendVideo(to, { url, mediaId, caption = '', filePath, mime
     { messaging_product: 'whatsapp', to, type: 'video', video: videoObj },
     { body: caption, media: { mediaId: resolvedId, mimeType, caption } }
   );
-  storeOutboundMedia(realMessageId, { filePath, url }, mimeType);
+  await storeOutboundMedia(realMessageId, { filePath, url }, mimeType);
   return metaRes;
 }
 
@@ -265,7 +265,7 @@ export async function sendAudio(to, { url, mediaId, filePath, mimeType = 'audio/
     { messaging_product: 'whatsapp', to, type: 'audio', audio: audioObj },
     { media: { mediaId: resolvedId, mimeType } }
   );
-  storeOutboundMedia(realMessageId, { filePath, url }, mimeType);
+  await storeOutboundMedia(realMessageId, { filePath, url }, mimeType);
   return metaRes;
 }
 
@@ -281,7 +281,7 @@ export async function sendDocument(to, { url, mediaId, caption = '', fileName = 
     { messaging_product: 'whatsapp', to, type: 'document', document: docObj },
     { body: caption, media: { mediaId: resolvedId, mimeType, fileName: resolvedName, caption } }
   );
-  storeOutboundMedia(realMessageId, { filePath, url }, mimeType);
+  await storeOutboundMedia(realMessageId, { filePath, url }, mimeType);
   return metaRes;
 }
 
