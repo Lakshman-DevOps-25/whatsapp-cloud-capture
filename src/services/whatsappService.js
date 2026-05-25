@@ -106,28 +106,82 @@ async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
   return { metaRes, realMessageId };
 }
 
+// // ─── Store outbound media in MinIO then update DB ─────────────────────────────
+// async function storeOutboundMedia(messageId, opts, mimeType) {
+//   try {
+//     let stored = {};
+//     if (opts.filePath) {
+//       stored = await storeLocalFile(opts.filePath, mimeType);
+//     } else if (opts.url) {
+//       const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
+//       stored = await downloadUrlAndStore(opts.url, mimeType, prefix);
+//     }
+
+//     if (opts.filePath) { 
+//       stored = await storeLocalFile(...) 
+//     } else if (opts.url) { 
+//       stored = await downloadUrlAndStore(...) 
+//     } else if (opts.mediaId)  { 
+//       stored = await downloadAndStoreMedia(opts.mediaId, ...);
+//     } 
+
+//     if (stored.minioUrl || stored.localPath) {
+//       const update = {};
+//       if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
+//       if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
+//       if (stored.localPath)    update['media.localPath']    = stored.localPath;
+//       if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
+//       if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
+//       await Message.collection.updateOne({ messageId }, { $set: update });
+//       console.log(`   ✅ Media stored: ${stored.minioUrl || stored.localPath}`);
+//     }
+//   } catch (err) {
+//     console.error(`   ❌ storeOutboundMedia(${messageId}): ${err.message}`);
+//   }
+// }
+
 // ─── Store outbound media in MinIO then update DB ─────────────────────────────
+// Handles all three cases: filePath (upload), url (link), mediaId (WA CDN)
 async function storeOutboundMedia(messageId, opts, mimeType) {
+  console.log(`   📤 [OutboundMedia] storing: messageId=${messageId} mimeType=${mimeType}`);
   try {
     let stored = {};
+    const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
+
     if (opts.filePath) {
+      // Case 1: file was uploaded — store directly to MinIO from disk
+      console.log(`   📁 Storing from filePath: ${opts.filePath}`);
       stored = await storeLocalFile(opts.filePath, mimeType);
+
     } else if (opts.url) {
-      const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
+      // Case 2: sent by URL — download from that URL and store in MinIO
+      console.log(`   🌐 Downloading from URL: ${opts.url}`);
       stored = await downloadUrlAndStore(opts.url, mimeType, prefix);
+
+    } else if (opts.mediaId) {
+      // Case 3: sent by WhatsApp media ID — download from WA CDN and store in MinIO
+      // This is the most common case for outbound media sent via mediaId
+      console.log(`   ☁️  Downloading from WA CDN: mediaId=${opts.mediaId}`);
+      const { downloadAndStoreMedia } = await import('./mediaService.js');
+      stored = await downloadAndStoreMedia(opts.mediaId, mimeType, prefix);
     }
-    if (stored.minioUrl || stored.localPath) {
+
+    if (stored && (stored.minioUrl || stored.localPath)) {
       const update = {};
       if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
       if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
       if (stored.localPath)    update['media.localPath']    = stored.localPath;
       if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
       if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
+      if (mimeType)            update['media.mimeType']     = mimeType;
       await Message.collection.updateOne({ messageId }, { $set: update });
-      console.log(`   ✅ Media stored: ${stored.minioUrl || stored.localPath}`);
+      console.log(`   ✅ Outbound media stored: ${stored.minioUrl || stored.localPath}`);
+    } else {
+      console.warn(`   ⚠️  No media stored for ${messageId} — no filePath, url, or mediaId provided`);
     }
   } catch (err) {
     console.error(`   ❌ storeOutboundMedia(${messageId}): ${err.message}`);
+    console.error(`      ${err.stack?.split('\n')[1] || ''}`);
   }
 }
 
@@ -156,6 +210,21 @@ export async function sendText(to, text) {
   return metaRes;
 }
 
+// export async function sendImage(to, { url, mediaId, caption = '', filePath, mimeType = 'image/jpeg' }) {
+//   let resolvedId = mediaId;
+//   if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
+//   if (!resolvedId && !url) throw new Error('sendImage: provide url, mediaId, or filePath');
+//   const imageObj = resolvedId ? { id: resolvedId } : { link: url };
+//   if (caption) imageObj.caption = caption;
+//   const { metaRes, realMessageId } = await sendAndSave(
+//     to, 'image',
+//     { messaging_product: 'whatsapp', to, type: 'image', image: imageObj },
+//     { body: caption, media: { mediaId: resolvedId, mimeType, caption } }
+//   );
+//   storeOutboundMedia(realMessageId, { filePath, url }, mimeType);
+//   return metaRes;
+// }
+
 export async function sendImage(to, { url, mediaId, caption = '', filePath, mimeType = 'image/jpeg' }) {
   let resolvedId = mediaId;
   if (filePath) resolvedId = await uploadMedia(filePath, mimeType);
@@ -167,7 +236,7 @@ export async function sendImage(to, { url, mediaId, caption = '', filePath, mime
     { messaging_product: 'whatsapp', to, type: 'image', image: imageObj },
     { body: caption, media: { mediaId: resolvedId, mimeType, caption } }
   );
-  storeOutboundMedia(realMessageId, { filePath, url }, mimeType);
+  storeOutboundMedia(realMessageId, { filePath, url, mediaId: resolvedId }, mimeType);
   return metaRes;
 }
 

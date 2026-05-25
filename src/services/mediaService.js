@@ -219,39 +219,74 @@ async function downloadAndStore(downloadUrl, mimeType, objectKey, axiosConfig = 
   }
 }
 
+// // ─────────────────────────────────────────────────────────────────────────────
+// // PUBLIC: INBOUND — download from WhatsApp CDN (needs auth header)
+// // ─────────────────────────────────────────────────────────────────────────────
+// export async function downloadAndStoreMedia(mediaId, mime, hint = null) {
+//   try {
+//     console.log(`\n📥 [INBOUND MEDIA] mediaId=${mediaId}`);
+  
+//     const meta      = await resolveMediaUrl(mediaId);
+//     const mimeType  = meta.mime_type || mime || 'application/octet-stream';
+//     const fileName  = hint || `${mediaId}.${extFromMime(mimeType)}`;
+//     const objectKey = `whatsapp/inbound/${mediaTypeFolder(mimeType)}/${fileName}`;
+  
+//     console.log(`   mimeType=${mimeType} objectKey=${objectKey}`);
+  
+//     const result = await downloadAndStore(
+//       meta.url,
+//       mimeType,
+//       objectKey,
+//       { headers: { Authorization: `Bearer ${TOKEN()}` } }
+//     );
+  
+//     return {
+//       ...result,
+//       fileName,
+//       mimeType,
+//       sha256:       meta.sha256,
+//       fileSize:     meta.file_size,
+//       downloadedAt: new Date(),
+//     };
+//   } catch (err) {
+//     console.error(`   ❌ Failed to download media ${mediaId}:`, err.message);
+//     throw err;
+//   }
+// }
+
 // ─────────────────────────────────────────────────────────────────────────────
-// PUBLIC: INBOUND — download from WhatsApp CDN (needs auth header)
+// PUBLIC: Download from WhatsApp CDN and store in MinIO/local
+// Used for both INBOUND and OUTBOUND (when sent via mediaId)
+// prefix param: optional folder override e.g. 'whatsapp/outbound/images'
 // ─────────────────────────────────────────────────────────────────────────────
-export async function downloadAndStoreMedia(mediaId, mime, hint = null) {
-  try {
-    console.log(`\n📥 [INBOUND MEDIA] mediaId=${mediaId}`);
-  
-    const meta      = await resolveMediaUrl(mediaId);
-    const mimeType  = meta.mime_type || mime || 'application/octet-stream';
-    const fileName  = hint || `${mediaId}.${extFromMime(mimeType)}`;
-    const objectKey = `whatsapp/inbound/${mediaTypeFolder(mimeType)}/${fileName}`;
-  
-    console.log(`   mimeType=${mimeType} objectKey=${objectKey}`);
-  
-    const result = await downloadAndStore(
-      meta.url,
-      mimeType,
-      objectKey,
-      { headers: { Authorization: `Bearer ${TOKEN()}` } }
-    );
-  
-    return {
-      ...result,
-      fileName,
-      mimeType,
-      sha256:       meta.sha256,
-      fileSize:     meta.file_size,
-      downloadedAt: new Date(),
-    };
-  } catch (err) {
-    console.error(`   ❌ Failed to download media ${mediaId}:`, err.message);
-    throw err;
-  }
+export async function downloadAndStoreMedia(mediaId, mime, prefix = null) {
+  const isOutbound = prefix && prefix.includes('outbound');
+  console.log(`\n📥 [${isOutbound ? 'OUTBOUND' : 'INBOUND'} MEDIA] mediaId=${mediaId}`);
+
+  const meta      = await resolveMediaUrl(mediaId);
+  const mimeType  = meta.mime_type || mime || 'application/octet-stream';
+  const fileName  = `${mediaId}.${extFromMime(mimeType)}`;
+  const folder    = prefix
+    ? `${prefix}/${fileName}`
+    : `whatsapp/inbound/${mediaTypeFolder(mimeType)}/${fileName}`;
+
+  console.log(`   mimeType=${mimeType} objectKey=${folder}`);
+
+  const result = await downloadAndStore(
+    meta.url,
+    mimeType,
+    folder,
+    { headers: { Authorization: `Bearer ${TOKEN()}` } }
+  );
+
+  return {
+    ...result,
+    fileName,
+    mimeType,
+    sha256:       meta.sha256,
+    fileSize:     meta.file_size,
+    downloadedAt: new Date(),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
