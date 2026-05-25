@@ -57,6 +57,7 @@ router.post('/', async (req, res) => {
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value;
+        console.log("Value after webhook post: ", value);
         if (!value) continue;
 
         // messages[] = inbound from customer (direction always = inbound)
@@ -255,18 +256,36 @@ async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
 // sendAndSave() is the sole writer of outbound records.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleStatus(status) {
+  console.log("Status.id: ", status.id);
   try {
     const update = { status: status.status };
     if (status.errors?.[0]) {
       update.errorCode    = status.errors[0].code?.toString();
       update.errorMessage = status.errors[0].title;
     }
+    
+    // const { default: Msg } = await import('../models/Message.js');
+    const Msg = mongoose.connection.db.collection('messages');
 
-    const { default: Msg } = await import('../models/Message.js');
-    const result = await Msg.collection.updateOne(
-      { messageId: status.id },
-      { $set: { ...update, updatedAt: new Date() } }
-    );
+    const filter = { messageId: status.id };
+
+    const updateQuery = {
+      $set: {
+        ...update,
+        updatedAt: new Date()
+      }
+    };
+    
+    console.log("MongoDB Query:");
+    console.log(JSON.stringify({ filter, update: updateQuery }, null, 2));
+    
+    const result = await Msg.collection.updateOne(filter, updateQuery);
+    
+    // const result = await Msg.collection.updateOne(
+    //   { messageId: status.id },
+    //   { $set: { ...update, updatedAt: new Date() } }
+    // );
+    console.log("Result: ", $result);
 
     if (result.matchedCount > 0) {
       console.log(`📬 STATUS [${status.id.slice(-10)}] → ${status.status}`);
@@ -275,10 +294,11 @@ async function handleStatus(status) {
       // Retry after 1.5s — saveMessage will have written the record by then
       setTimeout(async () => {
         try {
-          const r = await col.updateOne(
+          const r = await Msg.updateOne(
             { messageId: status.id },
             { $set: { ...update, updatedAt: new Date() } }
           );
+          console.log("📬 RETRY STATUS :", r);
           if (r.matchedCount > 0) {
             console.log(`📬 STATUS [${status.id.slice(-10)}] → sent (applied on retry)`);
           }

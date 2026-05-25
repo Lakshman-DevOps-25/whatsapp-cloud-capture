@@ -155,6 +155,7 @@ export async function resolveMediaUrl(mediaId) {
   }
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // INTERNAL: stream → MinIO
 // ─────────────────────────────────────────────────────────────────────────────
@@ -222,30 +223,35 @@ async function downloadAndStore(downloadUrl, mimeType, objectKey, axiosConfig = 
 // PUBLIC: INBOUND — download from WhatsApp CDN (needs auth header)
 // ─────────────────────────────────────────────────────────────────────────────
 export async function downloadAndStoreMedia(mediaId, mime, hint = null) {
-  console.log(`\n📥 [INBOUND MEDIA] mediaId=${mediaId}`);
-
-  const meta      = await resolveMediaUrl(mediaId);
-  const mimeType  = meta.mime_type || mime || 'application/octet-stream';
-  const fileName  = hint || `${mediaId}.${extFromMime(mimeType)}`;
-  const objectKey = `whatsapp/inbound/${mediaTypeFolder(mimeType)}/${fileName}`;
-
-  console.log(`   mimeType=${mimeType} objectKey=${objectKey}`);
-
-  const result = await downloadAndStore(
-    meta.url,
-    mimeType,
-    objectKey,
-    { headers: { Authorization: `Bearer ${TOKEN()}` } }
-  );
-
-  return {
-    ...result,
-    fileName,
-    mimeType,
-    sha256:       meta.sha256,
-    fileSize:     meta.file_size,
-    downloadedAt: new Date(),
-  };
+  try {
+    console.log(`\n📥 [INBOUND MEDIA] mediaId=${mediaId}`);
+  
+    const meta      = await resolveMediaUrl(mediaId);
+    const mimeType  = meta.mime_type || mime || 'application/octet-stream';
+    const fileName  = hint || `${mediaId}.${extFromMime(mimeType)}`;
+    const objectKey = `whatsapp/inbound/${mediaTypeFolder(mimeType)}/${fileName}`;
+  
+    console.log(`   mimeType=${mimeType} objectKey=${objectKey}`);
+  
+    const result = await downloadAndStore(
+      meta.url,
+      mimeType,
+      objectKey,
+      { headers: { Authorization: `Bearer ${TOKEN()}` } }
+    );
+  
+    return {
+      ...result,
+      fileName,
+      mimeType,
+      sha256:       meta.sha256,
+      fileSize:     meta.file_size,
+      downloadedAt: new Date(),
+    };
+  } catch (err) {
+    console.error(`   ❌ Failed to download media ${mediaId}:`, err.message);
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
