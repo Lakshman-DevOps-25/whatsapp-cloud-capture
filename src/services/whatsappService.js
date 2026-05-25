@@ -142,7 +142,7 @@ async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
 
 // ─── Store outbound media in MinIO then update DB ─────────────────────────────
 // Handles all three cases: filePath (upload), url (link), mediaId (WA CDN)
-await function storeOutboundMedia(messageId, opts, mimeType) {
+await storeOutboundMedia(messageId, opts, mimeType) {
   console.log(`   📤 [OutboundMedia] storing: messageId=${messageId} mimeType=${mimeType}`);
   try {
     let stored = {};
