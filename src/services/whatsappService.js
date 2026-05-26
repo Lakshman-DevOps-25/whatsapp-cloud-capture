@@ -90,7 +90,7 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
           type:        type,
           status:      'sent',
           waTimestamp: new Date(),
-          body:        extraFields.body        || null,
+          body:        extraFields.text.body        || null,
           media:       extraFields.media       || null,
           location:    extraFields.location    || null,
           rawPayload:  extraFields.rawPayload  || null,
