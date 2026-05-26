@@ -3,18 +3,34 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * GET  /webhook  — Meta verification
  * POST /webhook  — Inbound events from Meta
+ *
+ * IMPORTANT — HOW META WEBHOOKS WORK:
+ *
+ *   value.messages[]  → ALWAYS customer → business (inbound)
+ *                        Meta only puts customer-sent messages here.
+ *                        Messages sent via API never appear in messages[].
+ *
+ *   value.statuses[]  → Delivery receipts for business → customer messages
+ *                        (sent, delivered, read, failed)
+ *                        These update the outbound records already saved
+ *                        by whatsappService.js saveOutbound().
+ *
+ * So this file ONLY handles:
+ *   1. Inbound messages  (customer → business) → save to MongoDB + MinIO
+ *   2. Status updates    (delivery receipts)   → update existing MongoDB record
+ *
+ * Outbound messages (business → customer) are saved by whatsappService.js
+ * BEFORE the message is sent to Meta. Webhook only updates their status.
  */
 
-import express  from 'express';
-import mongoose from 'mongoose';
-import Contact  from '../models/Contact.js';
+import express from 'express';
+import Message from '../models/Message.js';
+import Contact from '../models/Contact.js';
 import { downloadAndStoreMedia } from '../services/mediaService.js';
 
-const router   = express.Router();
-const MY_PHONE = () => (process.env.WA_BUSINESS_PHONE || '').trim();
+const router = express.Router();
 
-// ── Always use mongoose.connection.db — guaranteed after connectDB() ──────────
-const col = () => mongoose.connection.db.collection('messages');
+const MY_PHONE = () => (process.env.WA_BUSINESS_PHONE || '').trim();
 
 // ─── GET /webhook — Meta verification ────────────────────────────────────────
 router.get('/', (req, res) => {
@@ -25,196 +41,244 @@ router.get('/', (req, res) => {
     console.log('✅ Webhook verified');
     return res.status(200).send(challenge);
   }
-  return res.sendStatus(403);
+  console.warn('⚠️  Webhook verify failed');
+  res.sendStatus(403);
 });
 
-// ─── POST /webhook — inbound events ──────────────────────────────────────────
-router.post('/', express.json(), async (req, res) => {
-  res.sendStatus(200); // always ACK immediately
+// ─── POST /webhook ────────────────────────────────────────────────────────────
+router.post('/', async (req, res) => {
+  res.sendStatus(200); // respond immediately
 
   try {
     const body = req.body;
     if (body.object !== 'whatsapp_business_account') return;
 
-    for (const entry of (body.entry || [])) {
-      for (const change of (entry.changes || [])) {
-        if (change.field !== 'messages') continue;
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
         const value = change.value;
+        if (!value) continue;
 
-        // Inbound messages (customer → business)
-        for (const msg of (value.messages || [])) {
-          await handleInbound(msg, value).catch(e =>
-            console.error('⚠️  handleInbound error:', e.message)
-          );
+        // messages[] = inbound from customer (direction always = inbound)
+        for (const msg of value.messages || []) {
+          await handleInbound(msg, value);
         }
 
-        // Status updates (delivery receipts for outbound)
-        for (const status of (value.statuses || [])) {
-          await handleStatus(status).catch(e =>
-            console.error('⚠️  handleStatus error:', e.message)
-          );
+        // statuses[] = delivery receipts for outbound messages sent via API
+        for (const status of value.statuses || []) {
+          await handleStatus(status);
         }
       }
     }
   } catch (err) {
-    console.error('⚠️  Webhook processing error:', err.message);
+    console.error('❌ Webhook error:', err.message);
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// INBOUND — customer → business
+// INBOUND: customer → business
+// All messages[] events are from customers. direction = inbound always.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleInbound(msg, value) {
-  const from    = msg.from;
-  const to      = MY_PHONE() || value.metadata?.display_phone_number || '';
-  const now     = new Date();
-  const ts      = msg.timestamp ? new Date(parseInt(msg.timestamp) * 1000) : now;
+  const myPhone     = MY_PHONE();
+  const fromPhone   = msg.from;           // customer's real phone number (E.164)
+  const toPhone     = myPhone;            // our business phone number
+  const isMedia     = ['image','video','audio','document','sticker'].includes(msg.type);
+  const contactInfo = value.contacts?.find(c => c.wa_id === msg.from);
+  const contactName = contactInfo?.profile?.name || '';
 
-  console.log(`\n📩 INBOUND ${msg.type?.toUpperCase()} from=${from} to=${to}`);
+  console.log(`📩 INBOUND | type=${msg.type} | from=${fromPhone} | to=${toPhone}`);
 
-  // ── Build document ─────────────────────────────────────────────────────────
-  const doc = {
-    messageId:   msg.id,
-    direction:   'inbound',
-    from,
-    to,
-    type:        msg.type,
-    status:      'received',
-    waTimestamp: ts,
-  };
-
-  // ── Extract content by type ────────────────────────────────────────────────
-  if (msg.type === 'text') {
-    doc.body = msg.text?.body || '';
-  }
-  if (['image','video','audio','document','sticker'].includes(msg.type)) {
-    const m = msg[msg.type] || {};
-    doc.media = {
-      mediaId:  m.id,
-      mimeType: m.mime_type,
-      sha256:   m.sha256,
-      fileName: m.filename || null,
-      caption:  m.caption  || null,
-    };
-  }
-  if (msg.type === 'location') {
-    doc.location = {
-      latitude:  msg.location?.latitude,
-      longitude: msg.location?.longitude,
-      name:      msg.location?.name    || '',
-      address:   msg.location?.address || '',
-    };
-  }
-  if (msg.type === 'reaction') {
-    doc.reaction = { messageId: msg.reaction?.message_id, emoji: msg.reaction?.emoji };
-  }
-  if (msg.type === 'button') {
-    doc.buttonReply = { text: msg.button?.text, payload: msg.button?.payload };
-  }
-  if (msg.type === 'interactive') {
-    const ir = msg.interactive;
-    doc.buttonReply = ir?.button_reply || ir?.list_reply || null;
-    doc.body        = doc.buttonReply?.title || '';
-  }
-  if (msg.type === 'contacts') {
-    doc.rawPayload = msg.contacts;
-  }
-
-  // ── Save to MongoDB ────────────────────────────────────────────────────────
-  try {
-    await col().updateOne(
-      { messageId: msg.id },
-      { $set: { ...doc, updatedAt: now }, $setOnInsert: { createdAt: now } },
-      { upsert: true }
-    );
-    console.log(`   ✅ Inbound saved: type=${doc.type} from=${from}`);
-  } catch (err) {
-    console.error(`   ❌ Inbound DB save failed (${msg.id}):`, err.message);
-    return;
-  }
-
-  // ── Upsert contact ─────────────────────────────────────────────────────────
+  // ── Upsert customer contact ───────────────────────────────────────────────
   try {
     await Contact.findOneAndUpdate(
-      { phone: from },
+      { phone: fromPhone },
       {
-        $set:         { phone: from, waId: from, lastSeen: now },
-        $inc:         { messageCount: 1 },
-        $setOnInsert: { firstSeen: now },
+        $set:         { phone: fromPhone, waId: fromPhone, name: contactName, lastSeen: new Date() },
+        $inc:         { messageCount: 1, ...(isMedia ? { mediaCount: 1 } : {}) },
+        $setOnInsert: { firstSeen: new Date() },
       },
       { upsert: true, new: true }
     );
   } catch (err) {
-    console.error(`   ⚠️  upsertContact(${from}):`, err.message);
+    console.error(`⚠️  Contact upsert(${fromPhone}):`, err.message);
   }
 
-  // ── Download + store media asynchronously ─────────────────────────────────
-  if (doc.media?.mediaId) {
-    storeInboundMedia(msg.id, doc.media.mediaId, doc.media.mimeType, doc.media.fileName)
-      .catch(e => console.error(`   ❌ storeInboundMedia error: ${e.message}`));
-  }
-}
+  // ── Build document ────────────────────────────────────────────────────────
+  const doc = {
+    messageId:        msg.id,
+    direction:        'inbound',
+    from:             fromPhone,
+    to:               toPhone,
+    contactName,
+    type:             msg.type,
+    waTimestamp:      new Date(parseInt(msg.timestamp) * 1000),
+    status:           'received',
+    contextMessageId: msg.context?.id || null,
+    rawPayload:       msg,
+  };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STORE INBOUND MEDIA — download from WA CDN → MinIO
-// ─────────────────────────────────────────────────────────────────────────────
-async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
-  if (!process.env.WA_ACCESS_TOKEN) {
-    console.error(`   ❌ WA_ACCESS_TOKEN not set — cannot download media ${mediaId}`);
+  // ── Type-specific fields ──────────────────────────────────────────────────
+  switch (msg.type) {
+    case 'text':
+      doc.body = msg.text?.body || '';
+      console.log(`   💬 "${doc.body}"`);
+      break;
+
+    case 'image':
+    case 'sticker': {
+      const m = msg[msg.type];
+      doc.media = { mediaId: m.id, mimeType: m.mime_type, sha256: m.sha256, caption: m.caption || '' };
+      doc.body  = m.caption || '';
+      console.log(`   🖼  mediaId=${m.id}`);
+      break;
+    }
+
+    case 'video': {
+      const m = msg.video;
+      doc.media = { mediaId: m.id, mimeType: m.mime_type, sha256: m.sha256, caption: m.caption || '' };
+      doc.body  = m.caption || '';
+      console.log(`   🎥 mediaId=${m.id}`);
+      break;
+    }
+
+    case 'audio': {
+      const m = msg.audio;
+      doc.media = { mediaId: m.id, mimeType: m.mime_type, sha256: m.sha256 };
+      console.log(`   🔊 mediaId=${m.id}`);
+      break;
+    }
+
+    case 'document': {
+      const m = msg.document;
+      doc.media = { mediaId: m.id, mimeType: m.mime_type, sha256: m.sha256, fileName: m.filename || '', caption: m.caption || '' };
+      doc.body  = m.caption || m.filename || '';
+      console.log(`   📄 ${m.filename || m.id}`);
+      break;
+    }
+
+    case 'location':
+      doc.location = { latitude: msg.location.latitude, longitude: msg.location.longitude, name: msg.location.name || '', address: msg.location.address || '' };
+      console.log(`   📍 ${msg.location.latitude},${msg.location.longitude}`);
+      break;
+
+    case 'contacts':
+      doc.body = JSON.stringify(msg.contacts);
+      console.log(`   👤 ${msg.contacts?.length} contact(s)`);
+      break;
+
+    case 'button':
+      doc.buttonReply = { id: msg.button?.payload, title: msg.button?.text };
+      doc.body        = msg.button?.text || '';
+      console.log(`   🔘 "${msg.button?.text}"`);
+      break;
+
+    case 'interactive': {
+      const ir = msg.interactive;
+      if (ir?.type === 'button_reply') {
+        doc.buttonReply = { id: ir.button_reply.id, title: ir.button_reply.title };
+        doc.body        = ir.button_reply.title;
+      } else if (ir?.type === 'list_reply') {
+        doc.buttonReply = { id: ir.list_reply.id, title: ir.list_reply.title };
+        doc.body        = ir.list_reply.title;
+      }
+      console.log(`   🗂  "${doc.body}"`);
+      break;
+    }
+
+    case 'reaction':
+      doc.reaction = { messageId: msg.reaction?.message_id, emoji: msg.reaction?.emoji };
+      doc.body     = msg.reaction?.emoji || '';
+      console.log(`   😀 ${msg.reaction?.emoji}`);
+      break;
+
+    default:
+      doc.type = 'unsupported';
+      doc.body = `[unsupported: ${msg.type}]`;
+  }
+
+  // ── Save to MongoDB ───────────────────────────────────────────────────────
+  try {
+    const saved = await Message.findOneAndUpdate(
+      { messageId: msg.id },
+      { $set: doc },
+      { upsert: true, new: true }
+    );
+    console.log(`   ✅ DB saved inbound [${msg.id}] _id=${saved._id}`);
+  } catch (err) {
+    console.error(`   ❌ DB save failed (${msg.id}):`, err.message);
     return;
   }
+
+  // ── Download + store media in MinIO/local (runs async after webhook 200 response) ──
+  if (isMedia && doc.media?.mediaId) {
+    storeInboundMedia(msg.id, doc.media.mediaId, doc.media.mimeType, doc.media.fileName || null);
+  }
+}
+
+async function storeInboundMedia(messageId, mediaId, mimeType, fileName) {
+  console.log(`\n   📥 Storing inbound media: mediaId=${mediaId}`);
   try {
-    const stored = await downloadAndStoreMedia(mediaId, mimeType, null);
-    if (stored && (stored.minioUrl || stored.localPath)) {
-      const update = {};
-      if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
-      if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
-      if (stored.localPath)    update['media.localPath']    = stored.localPath;
-      if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
-      if (stored.fileName)     update['media.fileName']     = stored.fileName || fileName;
-      if (stored.mimeType)     update['media.mimeType']     = stored.mimeType;
-      if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
-      await col().updateOne({ messageId }, { $set: update });
-      console.log(`   ✅ Inbound media stored: ${stored.minioUrl || stored.localPath}`);
+    const stored = await downloadAndStoreMedia(mediaId, mimeType, fileName);
+
+    const update = {};
+    if (stored.localPath)    update['media.localPath']    = stored.localPath;
+    if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
+    if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
+    if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
+    if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
+
+    if (Object.keys(update).length > 0) {
+      await Message.findOneAndUpdate({ messageId }, { $set: update });
+      console.log(`   ✅ Inbound media stored and DB updated: ${stored.minioUrl || stored.localPath}`);
     }
   } catch (err) {
-    console.error(`   ❌ Failed to download media ${mediaId}: ${err.message}`);
+    console.error(`   ❌ Inbound media store FAILED for mediaId=${mediaId}: ${err.message}`);
+    console.error(`      Stack: ${err.stack}`);
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STATUS UPDATE — delivery receipts for outbound messages
+// STATUS UPDATE: delivery receipt for outbound message
+//
+// Meta fires status=sent almost instantly after the API call — sometimes
+// before Message.create() finishes. So we UPSERT:
+//   - record exists  → update status field
+//   - record missing → create a placeholder (direction=outbound, type=unknown)
+//     sendAndSave() will later update the same messageId with full details,
+//     or this placeholder becomes the permanent record.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleStatus(status) {
   try {
-    const update = { status: status.status, updatedAt: new Date() };
+    const myPhone        = (process.env.WA_BUSINESS_PHONE || '').trim();
+    const recipientPhone = status.recipient_id || '';
+
+    const setFields = {
+      status:      status.status,
+      direction:   'outbound',
+      from:        myPhone,
+      to:          recipientPhone,
+      waTimestamp: status.timestamp ? new Date(parseInt(status.timestamp) * 1000) : new Date(),
+    };
+
     if (status.errors?.[0]) {
-      update.errorCode    = status.errors[0].code?.toString();
-      update.errorMessage = status.errors[0].title;
+      setFields.errorCode    = status.errors[0].code?.toString();
+      setFields.errorMessage = status.errors[0].title;
     }
 
-    const result = await col().updateOne(
+    const result = await Message.findOneAndUpdate(
       { messageId: status.id },
-      { $set: update }
+      {
+        $set:         setFields,
+        $setOnInsert: { messageId: status.id, type: 'unknown' },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    if (result.matchedCount > 0) {
-      console.log(`📬 STATUS [${status.id.slice(-10)}] → ${status.status}`);
-    } else if (status.status === 'sent') {
-      // status=sent fires ~50ms before saveMessage completes — retry after 1.5s
-      setTimeout(async () => {
-        try {
-          const r = await col().updateOne(
-            { messageId: status.id },
-            { $set: update }
-          );
-          if (r.matchedCount > 0) {
-            console.log(`📬 STATUS [${status.id.slice(-10)}] → sent (applied on retry)`);
-          }
-        } catch (_) {}
-      }, 1500);
+    const isPlaceholder = result.type === 'unknown';
+    if (isPlaceholder) {
+      console.log(`📬 STATUS [${status.id}] → ${status.status} (placeholder created)`);
     } else {
-      console.log(`📬 STATUS [${status.id.slice(-10)}] → ${status.status} (record not found)`);
+      console.log(`📬 STATUS [${status.id}] → ${status.status} from=${result.from} to=${result.to}`);
     }
   } catch (err) {
     console.error(`⚠️  Status update(${status.id}): ${err.message}`);

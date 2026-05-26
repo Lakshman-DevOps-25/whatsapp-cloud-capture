@@ -92,69 +92,13 @@ export function validateMediaConfig() {
 }
 
 // ── Resolve WhatsApp media download URL ──────────────────────────────────────
-// On 401: auto-refreshes the token once and retries before giving up
 export async function resolveMediaUrl(mediaId) {
-  const fetchWithToken = async (tok) => {
-    const { data } = await axios.get(`${BASE_URL()}/${mediaId}`, {
-      headers: { Authorization: `Bearer ${tok}` },
-      timeout: 15000,
-    });
-    return data;
-  };
-
-  const token = TOKEN();
-  if (!token) throw new Error('WA_ACCESS_TOKEN is not set — seed it via POST /api/admin/config');
-
-  try {
-    return await fetchWithToken(token);
-  } catch (err) {
-    if (err.response?.status !== 401) throw err;
-
-    // ── 401: token expired — try to auto-refresh once ────────────────────────
-    console.warn(`   ⚠️  [MediaService] 401 on mediaId=${mediaId}`);
-    console.warn(`   ⚠️  Token prefix: ${token.substring(0, 20)}...`);
-    console.warn(`   ⚠️  WA_APP_ID set: ${!!process.env.WA_APP_ID}`);
-    console.warn(`   ⚠️  WA_APP_SECRET set: ${!!process.env.WA_APP_SECRET}`);
-
-    // Fetch WA_APP_ID and WA_APP_SECRET directly from MongoDB
-    // (process.env may not have them if loadConfigFromDB() hadn't run yet)
-    console.warn(`   🔄 [MediaService] Fetching credentials from MongoDB for token refresh...`);
-    try {
-      const { getConfig }       = await import('./configService.js');
-      const { generateLongToken } = await import('./tokenService.js');
-
-      // Load from MongoDB directly — guaranteed to have latest values
-      const appId     = await getConfig('WA_APP_ID');
-      const appSecret = await getConfig('WA_APP_SECRET');
-
-      console.warn(`   WA_APP_ID from MongoDB     : ${appId     ? appId.substring(0, 10) + '...' : '❌ NOT FOUND'}`);
-      console.warn(`   WA_APP_SECRET from MongoDB : ${appSecret ? 'SET' : '❌ NOT FOUND'}`);
-
-      if (!appId || !appSecret) {
-        throw new Error(
-          `WA_APP_ID or WA_APP_SECRET not found in MongoDB.\n` +
-          `  Fix: POST /api/admin/config with WA_APP_ID and WA_APP_SECRET`
-        );
-      }
-
-      // Set into process.env so generateLongToken() can use them
-      process.env.WA_APP_ID     = appId;
-      process.env.WA_APP_SECRET = appSecret;
-
-      const result   = await generateLongToken();
-      const newToken = result.longToken || process.env.WA_ACCESS_TOKEN;
-      console.log(`   ✅ [MediaService] Token refreshed — retrying media download`);
-      return await fetchWithToken(newToken);
-    } catch (refreshErr) {
-      throw new Error(
-        `WA_ACCESS_TOKEN expired and auto-refresh failed.\n` +
-        `  Error: ${refreshErr.message}\n` +
-        `  Manual fix: POST /api/admin/refresh-token?secret=YOUR_ADMIN_SECRET`
-      );
-    }
-  }
+  const { data } = await axios.get(`${BASE_URL()}/${mediaId}`, {
+    headers: { Authorization: `Bearer ${TOKEN()}` },
+    timeout: 15000,
+  });
+  return data;
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INTERNAL: stream → MinIO
@@ -219,63 +163,23 @@ async function downloadAndStore(downloadUrl, mimeType, objectKey, axiosConfig = 
   }
 }
 
-// // ─────────────────────────────────────────────────────────────────────────────
-// // PUBLIC: INBOUND — download from WhatsApp CDN (needs auth header)
-// // ─────────────────────────────────────────────────────────────────────────────
-// export async function downloadAndStoreMedia(mediaId, mime, hint = null) {
-//   try {
-//     console.log(`\n📥 [INBOUND MEDIA] mediaId=${mediaId}`);
-  
-//     const meta      = await resolveMediaUrl(mediaId);
-//     const mimeType  = meta.mime_type || mime || 'application/octet-stream';
-//     const fileName  = hint || `${mediaId}.${extFromMime(mimeType)}`;
-//     const objectKey = `whatsapp/inbound/${mediaTypeFolder(mimeType)}/${fileName}`;
-  
-//     console.log(`   mimeType=${mimeType} objectKey=${objectKey}`);
-  
-//     const result = await downloadAndStore(
-//       meta.url,
-//       mimeType,
-//       objectKey,
-//       { headers: { Authorization: `Bearer ${TOKEN()}` } }
-//     );
-  
-//     return {
-//       ...result,
-//       fileName,
-//       mimeType,
-//       sha256:       meta.sha256,
-//       fileSize:     meta.file_size,
-//       downloadedAt: new Date(),
-//     };
-//   } catch (err) {
-//     console.error(`   ❌ Failed to download media ${mediaId}:`, err.message);
-//     throw err;
-//   }
-// }
-
 // ─────────────────────────────────────────────────────────────────────────────
-// PUBLIC: Download from WhatsApp CDN and store in MinIO/local
-// Used for both INBOUND and OUTBOUND (when sent via mediaId)
-// prefix param: optional folder override e.g. 'whatsapp/outbound/images'
+// PUBLIC: INBOUND — download from WhatsApp CDN (needs auth header)
 // ─────────────────────────────────────────────────────────────────────────────
-export async function downloadAndStoreMedia(mediaId, mime, prefix = null) {
-  const isOutbound = prefix && prefix.includes('outbound');
-  console.log(`\n📥 [${isOutbound ? 'OUTBOUND' : 'INBOUND'} MEDIA] mediaId=${mediaId}`);
+export async function downloadAndStoreMedia(mediaId, mime, hint = null) {
+  console.log(`\n📥 [INBOUND MEDIA] mediaId=${mediaId}`);
 
   const meta      = await resolveMediaUrl(mediaId);
   const mimeType  = meta.mime_type || mime || 'application/octet-stream';
-  const fileName  = `${mediaId}.${extFromMime(mimeType)}`;
-  const folder    = prefix
-    ? `${prefix}/${fileName}`
-    : `whatsapp/inbound/${mediaTypeFolder(mimeType)}/${fileName}`;
+  const fileName  = hint || `${mediaId}.${extFromMime(mimeType)}`;
+  const objectKey = `whatsapp/inbound/${mediaTypeFolder(mimeType)}/${fileName}`;
 
-  console.log(`   mimeType=${mimeType} objectKey=${folder}`);
+  console.log(`   mimeType=${mimeType} objectKey=${objectKey}`);
 
   const result = await downloadAndStore(
     meta.url,
     mimeType,
-    folder,
+    objectKey,
     { headers: { Authorization: `Bearer ${TOKEN()}` } }
   );
 

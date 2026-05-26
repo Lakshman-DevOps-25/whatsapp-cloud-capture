@@ -220,20 +220,31 @@ export async function loadConfigFromDB() {
 
   // ── Step 4: Auto-refresh if expired ─────────────────────────────────────────
   if (expiry.expired) {
-    console.log(`\n   ❌ Token is EXPIRED — auto-refreshing now...`);
+    console.log(`\n   ❌ Token is EXPIRED — attempting auto-refresh...`);
     try {
       const refreshed = await refreshToken(tok, appId, appSecret);
-
-      // Save new token to MongoDB + process.env
       await saveConfigToDB('WA_ACCESS_TOKEN',       refreshed.token);
       await saveConfigToDB('WA_TOKEN_GENERATED_AT', refreshed.generatedAt);
-
       const expiresAt = new Date(Date.now() + refreshed.expiresIn * 1000);
-      console.log(`   ✅ Token refreshed at boot — valid until ${expiresAt.toLocaleDateString('en-IN')}`);
-      console.log(`   ✅ New token saved to MongoDB — .env not modified\n`);
+      console.log(`   ✅ Token refreshed — valid until ${expiresAt.toLocaleDateString('en-IN')}`);
+      console.log(`   ✅ New token saved to MongoDB\n`);
     } catch (err) {
-      console.error(`   ❌ Auto-refresh FAILED: ${err.message}`);
-      console.error(`      Manual fix: POST /api/admin/refresh-token?secret=YOUR_ADMIN_SECRET\n`);
+      const is400 = err.message?.includes('400') || err.response?.status === 400;
+      if (is400) {
+        console.error(`   ❌ Token TOO OLD to exchange (HTTP 400) — Meta rejected the exchange`);
+        console.error(`   ──────────────────────────────────────────────────────────────────`);
+        console.error(`   REQUIRED ACTION — paste a fresh token:`);
+        console.error(`     1. Go to developers.facebook.com`);
+        console.error(`     2. Your App → WhatsApp → API Setup`);
+        console.error(`     3. Click "Generate access token" button`);
+        console.error(`     4. Copy the new token`);
+        console.error(`     5. Call: POST /api/admin/update-token`);
+        console.error(`        Body: { "secret": "YOUR_ADMIN_SECRET", "token": "EAAxxxxx" }`);
+        console.error(`   ──────────────────────────────────────────────────────────────────\n`);
+      } else {
+        console.error(`   ❌ Auto-refresh failed: ${err.message}`);
+        console.error(`      Fix: POST /api/admin/refresh-token?secret=YOUR_ADMIN_SECRET\n`);
+      }
     }
     return;
   }
