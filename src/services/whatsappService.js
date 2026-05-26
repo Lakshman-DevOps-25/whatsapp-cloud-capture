@@ -110,16 +110,29 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
 }
 
 // ─── Store media to MinIO and update DB record ────────────────────────────────
-// Runs AFTER message is saved — never blocks the send flow
 async function storeMediaAndUpdate(messageId, opts, mimeType) {
-  console.log(`   📦 Storing media for messageId=${messageId}...`);
+  console.log(`   📦 Storing media for messageId=${messageId} mimeType=${mimeType}`);
+  console.log(`   📦 filePath=${opts.filePath||'—'} url=${opts.url||'—'} mediaId=${opts.mediaId||'—'}`);
   try {
     let stored = {};
-    if (opts.filePath) {
+    const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
+
+    if (opts.filePath && fs.existsSync(opts.filePath)) {
+      // Case 1: local file upload
       stored = await storeLocalFile(opts.filePath, mimeType);
+
     } else if (opts.url) {
-      const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
+      // Case 2: public URL
       stored = await downloadUrlAndStore(opts.url, mimeType, prefix);
+
+    } else if (opts.mediaId) {
+      // Case 3: already on WhatsApp CDN — download from Meta and store in MinIO
+      const { downloadAndStoreMedia } = await import('./mediaService.js');
+      stored = await downloadAndStoreMedia(opts.mediaId, mimeType, prefix);
+
+    } else {
+      console.warn(`   ⚠️  No filePath/url/mediaId — nothing to store`);
+      return;
     }
 
     if (stored.minioUrl || stored.localPath) {
@@ -128,10 +141,13 @@ async function storeMediaAndUpdate(messageId, opts, mimeType) {
       if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
       if (stored.localPath)    update['media.localPath']    = stored.localPath;
       if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
+      if (stored.fileName)     update['media.fileName']     = stored.fileName;
       if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
 
       await Message.findOneAndUpdate({ messageId }, { $set: update });
       console.log(`   ✅ Media stored + DB updated: ${stored.minioUrl || stored.localPath}`);
+    } else {
+      console.warn(`   ⚠️  stored result empty:`, stored);
     }
   } catch (err) {
     console.error(`   ❌ Media store FAILED for ${messageId}: ${err.message}`);
@@ -188,7 +204,7 @@ export async function sendImage(to, { url, mediaId, caption = '', filePath, mime
   );
 
   // Store media copy AFTER DB save (non-blocking)
-  storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
+  await storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
 
   return metaRes;
 }
@@ -207,7 +223,7 @@ export async function sendVideo(to, { url, mediaId, caption = '', filePath, mime
     { body: caption, media: { mediaId: resolvedId, mimeType, caption } }
   );
 
-  storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
+  await storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
   return metaRes;
 }
 
@@ -224,7 +240,7 @@ export async function sendAudio(to, { url, mediaId, filePath, mimeType = 'audio/
     { media: { mediaId: resolvedId, mimeType } }
   );
 
-  storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
+  await storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
   return metaRes;
 }
 
@@ -247,7 +263,7 @@ export async function sendDocument(to, { url, mediaId, caption = '', fileName = 
     { body: caption, media: { mediaId: resolvedId, mimeType, fileName: resolvedName, caption } }
   );
 
-  storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
+  await storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
   return metaRes;
 }
 
