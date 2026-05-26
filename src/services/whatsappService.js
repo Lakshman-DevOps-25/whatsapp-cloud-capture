@@ -76,21 +76,51 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   if (!realMessageId) throw new Error(`Meta returned no messageId: ${JSON.stringify(metaRes)}`);
   console.log(`   🆔 messageId: ${realMessageId}`);
 
+  // ✅ ADD THIS — raw driver bypasses Mongoose schema, saves type + body correctly
+  try {
+    const now = new Date();
+    const result = await Message.collection.updateOne(
+      { messageId: realMessageId },
+      {
+        $set: {
+          messageId:   realMessageId,
+          direction:   'outbound',
+          from:        fromPhone,
+          to:          toPhone,
+          type:        type,
+          status:      'sent',
+          waTimestamp: new Date(),
+          body:        extraFields.body        || null,
+          media:       extraFields.media       || null,
+          location:    extraFields.location    || null,
+          rawPayload:  extraFields.rawPayload  || null,
+          updatedAt:   now,
+        },
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true }
+    );
+    console.log(`   ✅ DB saved: matched=${result.matchedCount} upserted=${result.upsertedCount} type=${type} body=${extraFields.body||'—'}`);
+  } catch (dbErr) {
+    console.error(`   ❌ DB save FAILED: ${dbErr.message}`);
+    console.error(`      ${dbErr.stack}`);
+  }
+
   // Step 2: Save to MongoDB
   // Use upsert — handles race where status webhook already created a placeholder
-  const doc = {
-    messageId:   realMessageId,
-    direction:   'outbound',
-    from:        fromPhone,
-    to:          toPhone,
-    type,
-    waTimestamp: new Date(),
-    status:      'sent',
-  };
-  if (extraFields.body)       doc.body       = extraFields.body;
-  if (extraFields.media)      doc.media      = extraFields.media;
-  if (extraFields.location)   doc.location   = extraFields.location;
-  if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
+  // const doc = {
+  //   messageId:   realMessageId,
+  //   direction:   'outbound',
+  //   from:        fromPhone,
+  //   to:          toPhone,
+  //   type,
+  //   waTimestamp: new Date(),
+  //   status:      'sent',
+  // };
+  // if (extraFields.body)       doc.body       = extraFields.body;
+  // if (extraFields.media)      doc.media      = extraFields.media;
+  // if (extraFields.location)   doc.location   = extraFields.location;
+  // if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
 
   try {
     const saved = await Message.findOneAndUpdate(
