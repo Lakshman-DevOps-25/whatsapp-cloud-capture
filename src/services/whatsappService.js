@@ -90,7 +90,7 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
           type:        type,
           status:      'sent',
           waTimestamp: new Date(),
-          body:        extraFields.text.body        || null,
+          body:        extraFields.body        || null,
           media:       extraFields.media       || null,
           location:    extraFields.location    || null,
           rawPayload:  extraFields.rawPayload  || null,
@@ -139,51 +139,7 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   return { metaRes, realMessageId };
 }
 
-// ─── Store media to MinIO and update DB record ────────────────────────────────
-async function storeMediaAndUpdate(messageId, opts, mimeType) {
-  console.log(`   📦 Storing media for messageId=${messageId} mimeType=${mimeType}`);
-  console.log(`   📦 filePath=${opts.filePath||'—'} url=${opts.url||'—'} mediaId=${opts.mediaId||'—'}`);
-  try {
-    let stored = {};
-    const prefix = `whatsapp/outbound/${mediaTypeFolder(mimeType)}`;
-
-    if (opts.filePath && fs.existsSync(opts.filePath)) {
-      // Case 1: local file upload
-      stored = await storeLocalFile(opts.filePath, mimeType);
-
-    } else if (opts.url) {
-      // Case 2: public URL
-      stored = await downloadUrlAndStore(opts.url, mimeType, prefix);
-
-    } else if (opts.mediaId) {
-      // Case 3: already on WhatsApp CDN — download from Meta and store in MinIO
-      const { downloadAndStoreMedia } = await import('./mediaService.js');
-      stored = await downloadAndStoreMedia(opts.mediaId, mimeType, prefix);
-
-    } else {
-      console.warn(`   ⚠️  No filePath/url/mediaId — nothing to store`);
-      return;
-    }
-
-    if (stored.minioUrl || stored.localPath) {
-      const update = {};
-      if (stored.minioKey)     update['media.minioKey']     = stored.minioKey;
-      if (stored.minioUrl)     update['media.minioUrl']     = stored.minioUrl;
-      if (stored.localPath)    update['media.localPath']    = stored.localPath;
-      if (stored.fileSize)     update['media.fileSize']     = stored.fileSize;
-      if (stored.fileName)     update['media.fileName']     = stored.fileName;
-      if (stored.downloadedAt) update['media.downloadedAt'] = stored.downloadedAt;
-
-      await Message.findOneAndUpdate({ messageId }, { $set: update });
-      console.log(`   ✅ Media stored + DB updated: ${stored.minioUrl || stored.localPath}`);
-    } else {
-      console.warn(`   ⚠️  stored result empty:`, stored);
-    }
-  } catch (err) {
-    console.error(`   ❌ Media store FAILED for ${messageId}: ${err.message}`);
-    console.error(`      ${err.stack}`);
-  }
-}
+storeMediaAndUpdate
 
 // ─── Upload to WhatsApp CDN ───────────────────────────────────────────────────
 export async function uploadMedia(filePath, mimeType) {
@@ -234,7 +190,7 @@ export async function sendImage(to, { url, mediaId, caption = '', filePath, mime
   );
 
   // Store media copy AFTER DB save (non-blocking)
-  await storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
+  await storeMediaAndUpdate(realMessageId, { filePath, url, mediaId: resolvedId  }, mimeType);
 
   return metaRes;
 }
@@ -253,7 +209,7 @@ export async function sendVideo(to, { url, mediaId, caption = '', filePath, mime
     { body: caption, media: { mediaId: resolvedId, mimeType, caption } }
   );
 
-  await storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
+  await storeMediaAndUpdate(realMessageId, { filePath, url, mediaId: resolvedId  }, mimeType);
   return metaRes;
 }
 
@@ -270,7 +226,7 @@ export async function sendAudio(to, { url, mediaId, filePath, mimeType = 'audio/
     { media: { mediaId: resolvedId, mimeType } }
   );
 
-  await storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
+  await storeMediaAndUpdate(realMessageId, { filePath, url, mediaId: resolvedId  }, mimeType);
   return metaRes;
 }
 
@@ -293,7 +249,7 @@ export async function sendDocument(to, { url, mediaId, caption = '', fileName = 
     { body: caption, media: { mediaId: resolvedId, mimeType, fileName: resolvedName, caption } }
   );
 
-  await storeMediaAndUpdate(realMessageId, { filePath, url }, mimeType);
+  await storeMediaAndUpdate(realMessageId, { filePath, url, mediaId: resolvedId  }, mimeType);
   return metaRes;
 }
 
