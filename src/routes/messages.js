@@ -126,19 +126,140 @@ router.get('/contacts/list', async (req, res) => {
 // SEND ENDPOINTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-// POST /api/send/text
-// Body (JSON):      { "to": "919876543210", "text": "Hello" }
-router.post('/send/text', async (req, res) => {
+// ─── POST /api/send (universal — routes by type field) ────────────────────────
+router.post('/send', upload.single('media'), async (req, res) => {
+  console.log('\n' + '█'.repeat(50));
+  console.log('🔴 POST /api/send HIT');
+  console.log('body:', JSON.stringify(req.body));
+  console.log('█'.repeat(50));
+ 
   try {
-    console.log(`\n[POST /send/text] body:`, req.body);
-    const { to, text } = req.body;
-    if (!to)   return res.status(400).json({ error: 'to is required' });
-    if (!text) return res.status(400).json({ error: 'text is required' });
-    const result = await sendText(to, text);
+    const { to, type } = req.body;
+ 
+    if (!to)   return res.status(400).json({ error: '"to" is required' });
+    if (!type) return res.status(400).json({ error: '"type" is required' });
+ 
+    let result;
+ 
+    switch (type) {
+ 
+      case 'text': {
+        const rawText  = req.body.text;
+        const bodyText = (typeof rawText === 'object' && rawText !== null)
+          ? (rawText.body || '')
+          : (rawText || '');
+        if (!bodyText) return res.status(400).json({ error: 'text.body is required for type=text' });
+        console.log(`   text body: "${bodyText}"`);
+        result = await sendText(to, bodyText);
+        break;
+      }
+ 
+      case 'image': {
+        const img     = req.body.image || {};
+        const caption = img.caption || req.body.caption || '';
+        const url     = img.link    || req.body.url     || '';
+        const mediaId = img.id      || req.body.mediaId || '';
+        const opts    = { caption, url: url||undefined, mediaId: mediaId||undefined };
+        if (req.file) { opts.filePath = req.file.path; opts.mimeType = req.file.mimetype; }
+        if (!url && !mediaId && !req.file) return res.status(400).json({ error: 'image.link, image.id, or file upload required' });
+        result = await sendImage(to, opts);
+        break;
+      }
+ 
+      case 'video': {
+        const vid     = req.body.video || {};
+        const caption = vid.caption || req.body.caption || '';
+        const url     = vid.link    || req.body.url     || '';
+        const mediaId = vid.id      || req.body.mediaId || '';
+        const opts    = { caption, url: url||undefined, mediaId: mediaId||undefined };
+        if (req.file) { opts.filePath = req.file.path; opts.mimeType = req.file.mimetype; }
+        if (!url && !mediaId && !req.file) return res.status(400).json({ error: 'video.link, video.id, or file upload required' });
+        result = await sendVideo(to, opts);
+        break;
+      }
+ 
+      case 'audio': {
+        const aud     = req.body.audio || {};
+        const url     = aud.link  || req.body.url     || '';
+        const mediaId = aud.id    || req.body.mediaId || '';
+        const opts    = { url: url||undefined, mediaId: mediaId||undefined };
+        if (req.file) { opts.filePath = req.file.path; opts.mimeType = req.file.mimetype; }
+        if (!url && !mediaId && !req.file) return res.status(400).json({ error: 'audio.link, audio.id, or file upload required' });
+        result = await sendAudio(to, opts);
+        break;
+      }
+ 
+      case 'document': {
+        const doc      = req.body.document || {};
+        const caption  = doc.caption  || req.body.caption  || '';
+        const fileName = doc.filename || req.body.fileName || '';
+        const url      = doc.link     || req.body.url      || '';
+        const mediaId  = doc.id       || req.body.mediaId  || '';
+        const opts     = { caption, fileName, url: url||undefined, mediaId: mediaId||undefined };
+        if (req.file) { opts.filePath = req.file.path; opts.mimeType = req.file.mimetype; opts.fileName = opts.fileName || req.file.originalname; }
+        if (!url && !mediaId && !req.file) return res.status(400).json({ error: 'document.link, document.id, or file upload required' });
+        result = await sendDocument(to, opts);
+        break;
+      }
+ 
+      case 'location': {
+        const loc = req.body.location || {};
+        if (!loc.latitude || !loc.longitude) return res.status(400).json({ error: 'location.latitude and longitude required' });
+        result = await sendLocation(to, { latitude: loc.latitude, longitude: loc.longitude, name: loc.name||'', address: loc.address||'' });
+        break;
+      }
+ 
+      case 'template': {
+        const tmpl = req.body.template || {};
+        if (!tmpl.name) return res.status(400).json({ error: 'template.name is required' });
+        result = await sendTemplate(to, tmpl.name, tmpl.language?.code || 'en_US', tmpl.components || []);
+        break;
+      }
+ 
+      default:
+        return res.status(400).json({ error: `Unsupported type: "${type}"` });
+    }
+ 
     res.json(result);
   } catch (err) {
-    console.error(`[POST /send/text] ERROR:`, err.message);
-    console.error(`[ROUTE ERROR] ${err.message}`, err.stack);
+    console.error('❌ /api/send ERROR:', err.message);
+    console.error(err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/send/text ──────────────────────────────────────────────────────
+// Accepts both formats:
+//   Format 1: { "to": "918...", "text": "Hello" }
+//   Format 2: { "messaging_product":"whatsapp", "to":"918...", "type":"text", "text":{"body":"Hello"} }
+router.post('/send/text', async (req, res) => {
+  console.log('\n' + '█'.repeat(50));
+  console.log('🔴 POST /api/send/text HIT');
+  console.log('body:', JSON.stringify(req.body));
+  console.log('WA_PHONE_NUMBER_ID:', process.env.WA_PHONE_NUMBER_ID || 'NOT SET');
+  console.log('WA_BUSINESS_PHONE :', process.env.WA_BUSINESS_PHONE  || 'NOT SET');
+  console.log('WA_ACCESS_TOKEN   :', process.env.WA_ACCESS_TOKEN ? 'SET' : 'NOT SET');
+  console.log('█'.repeat(50));
+ 
+  try {
+    const { to } = req.body;
+ 
+    // Handle both string and object formats for text
+    const rawText  = req.body.text;
+    const bodyText = (typeof rawText === 'object' && rawText !== null)
+      ? (rawText.body || '')
+      : (rawText || '');
+ 
+    if (!to)       return res.status(400).json({ error: 'to is required' });
+    if (!bodyText) return res.status(400).json({ error: 'text or text.body is required' });
+ 
+    console.log(`   Extracted: to=${to} bodyText="${bodyText}"`);
+ 
+    const result = await sendText(to, bodyText);
+    res.json(result);
+  } catch (err) {
+    console.error('❌ /api/send/text ERROR:', err.message);
+    console.error(err.stack);
     res.status(500).json({ error: err.message });
   }
 });
