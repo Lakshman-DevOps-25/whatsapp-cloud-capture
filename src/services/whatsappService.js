@@ -58,17 +58,15 @@ async function upsertContact(phone) {
   }
 }
 
-// ─── Core: send to Meta + save to MongoDB ────────────────────────────────────
-async function sendAndSave(to, type, metaPayload, extraFields = {}) {
+// ✅ Fixed — rename parameter to msgType to avoid any shadowing
+async function sendAndSave(to, msgType, metaPayload, extraFields = {}) {
   const toPhone   = (to || '').toString().trim();
   const fromPhone = MY_PHONE();
 
   if (!toPhone) throw new Error(`"to" phone number is required`);
 
   console.log(`\n${'─'.repeat(50)}`);
-  console.log(`📤 ${type.toUpperCase()} | from=${fromPhone || '(WA_BUSINESS_PHONE not set)'} | to=${toPhone}`);
-
-  console.log(`Type: ${type}`, type);
+  console.log(`📤 ${msgType.toUpperCase()} | from=${fromPhone || '(WA_BUSINESS_PHONE not set)'} | to=${toPhone}`);
 
   // Step 1: Send to Meta
   const metaRes       = await postMessage(metaPayload);
@@ -76,9 +74,9 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
   if (!realMessageId) throw new Error(`Meta returned no messageId: ${JSON.stringify(metaRes)}`);
   console.log(`   🆔 messageId: ${realMessageId}`);
 
-  // ✅ ADD THIS — raw driver bypasses Mongoose schema, saves type + body correctly
+  // Step 2: Save to MongoDB — use raw collection to avoid Mongoose stripping 'type'
   try {
-    const now = new Date();
+    const now    = new Date();
     const result = await Message.collection.updateOne(
       { messageId: realMessageId },
       {
@@ -87,50 +85,23 @@ async function sendAndSave(to, type, metaPayload, extraFields = {}) {
           direction:   'outbound',
           from:        fromPhone,
           to:          toPhone,
-          type:        type,
+          type:        msgType,              // ← uses renamed parameter, no ambiguity
           status:      'sent',
           waTimestamp: new Date(),
-          body:        extraFields.body        || null,
-          media:       extraFields.media       || null,
-          location:    extraFields.location    || null,
-          rawPayload:  extraFields.rawPayload  || null,
+          body:        extraFields.body       || null,
+          media:       extraFields.media      || null,
+          location:    extraFields.location   || null,
+          rawPayload:  extraFields.rawPayload || null,
           updatedAt:   now,
         },
         $setOnInsert: { createdAt: now },
       },
       { upsert: true }
     );
-    console.log(`   ✅ DB saved: matched=${result.matchedCount} upserted=${result.upsertedCount} type=${type} body=${extraFields.body||'—'}`);
+    console.log(`   ✅ DB saved: matched=${result.matchedCount} upserted=${result.upsertedCount} type=${msgType} body=${extraFields.body||'—'}`);
   } catch (dbErr) {
     console.error(`   ❌ DB save FAILED: ${dbErr.message}`);
     console.error(`      ${dbErr.stack}`);
-  }
-
-  // Step 2: Save to MongoDB
-  // Use upsert — handles race where status webhook already created a placeholder
-  // const doc = {
-  //   messageId:   realMessageId,
-  //   direction:   'outbound',
-  //   from:        fromPhone,
-  //   to:          toPhone,
-  //   type,
-  //   waTimestamp: new Date(),
-  //   status:      'sent',
-  // };
-  // if (extraFields.body)       doc.body       = extraFields.body;
-  // if (extraFields.media)      doc.media      = extraFields.media;
-  // if (extraFields.location)   doc.location   = extraFields.location;
-  // if (extraFields.rawPayload) doc.rawPayload = extraFields.rawPayload;
-
-  try {
-    const saved = await Message.findOneAndUpdate(
-      { messageId: realMessageId },
-      { $set: doc },
-      { upsert: true, new: true }
-    );
-    console.log(`   ✅ DB saved: _id=${saved._id} | from=${saved.from} | to=${saved.to}`);
-  } catch (dbErr) {
-    console.error(`   ❌ DB save FAILED: ${dbErr.message}`);
   }
 
   // Step 3: Upsert contact
@@ -210,10 +181,20 @@ export async function uploadMedia(filePath, mimeType) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function sendText(to, text, previewUrl = false) {
+  // Extract body string whether text is a string or { body: "..." } object
+  const bodyText = typeof text === 'object' ? (text?.body || '') : (text || '');
+
   const { metaRes } = await sendAndSave(
-    to, 'text',
-    { messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { body: text, preview_url: previewUrl } },
-    { body: text }
+    to,
+    'text',
+    {
+      messaging_product: 'whatsapp',
+      recipient_type:    'individual',
+      to,
+      type:  'text',
+      text:  { body: bodyText, preview_url: previewUrl },
+    },
+    { body: bodyText }    // ← extraFields.body now correctly set
   );
   return metaRes;
 }
